@@ -36,6 +36,7 @@ Everything below is built on top of upstream `arcanite24/gb-recompiled`. Most ar
 ### Display pipeline
 - **GLES 2.0 rendering backend** with a built-in post-process shader pipeline. One binary covers desktop Mesa, Mali, Adreno — same shaders run everywhere.
 - **Shipped shader presets** (sharp / scanlines / CRT-like effects) selectable from the Esc menu's Look section. Per-game shader preference stays sticky once set.
+- **RetroArch `.slangp` presets through [librashader](https://github.com/SnowflakePowered/librashader)** (`runtime/src/librashader_chain.cpp`), opened at run time: put a `librashader.dll` / `.so` built with `--no-default-features --features runtime-opengl` and a `shaders/` folder of presets beside the binary. Picker with filter, live parameters, bezel mode, and a preset editor (the picked preset's passes changed, reordered or added to, whole presets chained, and saved as presets of your own, which can be deleted again, to the Recycle Bin on Windows; `runtime/src/slang_preset.cpp`). Needs GLES 3.0+ (ANGLE gives 3.1 when asked). On Windows a new preset is first compiled in a hidden child process, because Microsoft's HLSL optimizer under ANGLE overflows its stack on a few presets; such a preset is retried, and then run, with the optimizer off (ANGLE's `D3DCompile` is routed through the runtime for that). Compiled programs persist in `shader_cache/` (`runtime/src/gl_program_cache.cpp`). librashader's GLSL ES output needs a few patches to work under ANGLE; the Shantae repo carries them.
 
 ### Experimental custom game views
 
@@ -58,10 +59,13 @@ For isolated test instances, `GBRECOMP_DEBUG_PORT` chooses a TCP debug port
 - **Cart-border cache** — SGB border decoded once and cached to disk so non-SGB modes can still display it.
 - **Pocket / Light palette presets**, **Show FPS overlay**, **audio settings**, **input remapping** with controller support and per-profile labels (Xbox / PlayStation / Nintendo / Generic).
 - **Savestates** with multi-slot UI.
+- **Cheats** — libretro-database `.cht` files (GameShark RAM writes each frame, Game Genie ROM patches) in `cheats/` beside the game's other state: a build of one game reads every `.cht` there and in `cheats/<save id>/`; a build that loads games reads `cheats/<game id>/` and the `.cht` files named after that id. **Reload Cheats** reads them again without a restart (`runtime/src/cheats.c`).
 
 ### Launcher infrastructure
 - **Multi-ROM launcher** with a graphical picker, missing-ROM tagging, and `--game <id>` headless launch.
-- **Single-cart auto-start** — when a launcher has exactly one game registered, the picker is skipped and the cart boots straight up. Esc menu's "Return to Launcher" is replaced with "Restart Game" so you can reboot the cart from inside the menu.
+- **Single-cart auto-start** — when a launcher has exactly one game registered, the picker is skipped and the cart boots straight up.
+- **Restart Game, Return to Launcher, Quit** — in the Esc menu's System section (press twice) and the settings window's footer (with a confirmation). Restart Game puts the machine back as it was before its first frame, in place, keeping the cart's battery RAM (`gb_before_first_frame` keeps that state). Return to Launcher hands exit code 64 to a launcher that started the game; in a build whose recomp-ui launcher runs before the game, the program starts again with `GBRECOMP_LAUNCHER=1` once this one has saved and closed.
+- **Menus hold the game** — while the Esc menu or the settings window is open the game waits, silent (Pause in Menu, `ui.pause_in_menu`), and gets no keys or buttons; shortcuts do not fire, including while typing into a filter field. Game Dimming and Menu Opacity (`ui.menu_dim`, `ui.menu_opacity`) set how much the menus cover the game.
 - **`--prefix-symbols`** flag on `gbrecomp` so multiple carts can be linked into one binary without symbol collisions.
 - **Native asset-loader integration** — ROM data is bundled into the binary as compressed sections that get extracted into `assets/<id>/` on first boot.
 - **`roms/` subfolder convention** — user-supplied ROMs live at `roms/<id>.<ext>` next to the binary.
@@ -249,3 +253,20 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the full recompilation test report.
 <p align="center">
   <a href="https://discord.gg/Ad9BwSzctP"><img src=".github/raid-discord.png" alt="Join the Retro AI Development (R.A.I.D.) Discord" width="200"></a>
 </p>
+
+
+### Exhaustive MBC5 ROM entries
+
+A game config can set `[options] exhaustive_rom = true` for a 2-256-bank MBC5
+image. This emits a native instruction entry for every ROM byte in both fixed
+and switchable mappings (including bank zero), plus HALT-bug fetch variants.
+The analyzed functions remain the fast path. Unanalyzed ROM entries use static
+address maps and operand-specialized native C functions; cross-window operands
+are read live. Every-byte `.asm` listings include data and overlapping candidates,
+so this is executable coverage rather than a semantic code/data classification.
+The `<prefix>_exhaustive.json` report records the ROM fingerprint and entry counts.
+Unknown executable RAM and illegal opcodes terminate with a diagnostic instead
+of using the interpreter. Generic RAM opcode helpers are disabled in this mode;
+games must provide compiled overlays or location-specific native RAM translations
+through `game_dispatch_override`. Explicit interpreter/differential modes remain available. `scan_banks` continues
+to control only the ordinary function-discovery pass.
