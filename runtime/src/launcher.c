@@ -297,7 +297,27 @@ int launcher_apply_patch_in_memory(const char *patch_filename,
     return 1;
 }
 
+/* Do the game's extras.c CRC hooks decide (they take precedence)? */
+static int have_crc_policy(void) {
+    int valid_count = 0;
+    const uint32_t *valid_list = game_get_valid_crcs(&valid_count);
+    if (valid_count > 0 && valid_list) return 1;
+    return valid_count == 0 && game_get_expected_crc32() != 0;
+}
+
 /* ── Public API ───────────────────────────────────────────────────────────── */
+
+const char *launcher_identity_sha256(void) {
+    if (have_crc_policy() || !s_expected_sha256[0]) return NULL;
+    if (s_patch_file[0]) {
+        /* A shipped patch lets a stock ROM through by patching it, so the
+         * digest of the file picked is not the expected one. */
+        char patch_path[600];
+        resolve_payload_file(s_patch_file, patch_path, sizeof(patch_path));
+        if (file_exists(patch_path)) return NULL;
+    }
+    return s_expected_sha256;
+}
 
 /* Returns: 0 invalid, 1 valid as-is, 2 valid after producing a patched file
  * (the resolved path is written into `resolved`). */
@@ -308,11 +328,10 @@ static int verify_rom(const char *path, char *resolved, size_t resolved_sz) {
     int valid_count = 0;
     const uint32_t *valid_list = game_get_valid_crcs(&valid_count);
     uint32_t expected_single = (valid_count == 0) ? game_get_expected_crc32() : 0;
-    int have_crc = (valid_count > 0 && valid_list) || expected_single != 0;
 
     /* No CRC policy → SHA-256 exact-match, with optional BPS auto-patch. CRC
      * hooks take precedence (multi-revision carts keep their valid-list). */
-    if (!have_crc) {
+    if (!have_crc_policy()) {
         if (!s_expected_sha256[0]) return 1;  /* nothing to verify */
         char patched[512];
         if (resolve_or_patch(path, patched, sizeof(patched))) {
@@ -320,6 +339,9 @@ static int verify_rom(const char *path, char *resolved, size_t resolved_sz) {
             snprintf(resolved, resolved_sz, "%s", patched);
             return changed ? 2 : 1;
         }
+        snprintf(s_last_error, sizeof(s_last_error), "ROM SHA-256 mismatch: %s", path);
+        fprintf(stderr, "[Launcher] %s is not the ROM this build was recompiled from "
+                        "(that one has SHA-256 %s)\n", path, s_expected_sha256);
 #ifdef _WIN32
         MessageBoxA(NULL,
             "ROM SHA-256 mismatch!\n\nThis is not the ROM this build expects,\n"

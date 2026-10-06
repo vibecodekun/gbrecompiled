@@ -7,6 +7,7 @@
 #include "launcher_ui_seam.h"
 #include "game_extras.h"
 #include "gb_host_paths.h"
+#include "launcher.h"
 
 #include "recomp_launcher.h"   // recomp-ui C ABI
 #include "launcher_profile.h"  // launcher_profile_apply()
@@ -119,6 +120,20 @@ static void seam_write_rom_cfg(const char* path, const char* rom) {
     fclose(f);
 }
 
+/* 64 hex digits -> 32 bytes; 0 if `hex` is not exactly that. */
+static int seam_sha256_bytes(const char* hex, uint8_t out[32]) {
+    for (int i = 0; i < 64; ++i) {
+        char c = hex[i];
+        int v = (c >= '0' && c <= '9') ? c - '0'
+              : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (v < 0) return 0;
+        if (i & 1) out[i / 2] |= (uint8_t)v;
+        else       out[i / 2] = (uint8_t)(v << 4);
+    }
+    return hex[64] == '\0';
+}
+
 /* ── the seam ─────────────────────────────────────────────────────────────── */
 
 int gb_launcher_preboot(void) {
@@ -178,18 +193,27 @@ int gb_launcher_preboot(void) {
      * mismatched path; in-game saving is unaffected. */
     gi.sram_path = NULL;
 
-    /* ROM identity gate (advisory badge; launcher_get_rom_path is authoritative).
-     * Prefer the multi-revision CRC list, else the single expected CRC. gb uses
-     * SHA-256 which the ABI's SHA-1 field can't carry, so SHA-only titles show
-     * no CRC and rely on the runtime's own verify. */
+    /* ROM identity gate: the launcher marks the pick "verified" and enables
+     * Play only when it matches; launcher_get_rom_path() checks again at boot.
+     * Prefer the multi-revision CRC list, else the single expected CRC, else
+     * the SHA-256 the recompiler embedded (main() registers it before this
+     * runs). Never more than one: the launcher demands every fingerprint it is
+     * given. With none it can vouch for nothing and lets every ROM through. */
+    static uint8_t s_known_sha256[1][32];
     int crc_count = 0;
     const uint32_t* crcs = game_get_valid_crcs(&crc_count);
     if (crc_count > 0 && crcs) {
         gi.expected_crc = crcs[0];
         gi.has_expected_crc = 1;
+    } else if (game_get_expected_crc32()) {
+        gi.expected_crc = game_get_expected_crc32();
+        gi.has_expected_crc = 1;
     } else {
-        uint32_t c = game_get_expected_crc32();
-        if (c) { gi.expected_crc = c; gi.has_expected_crc = 1; }
+        const char* sha = launcher_identity_sha256();
+        if (sha && seam_sha256_bytes(sha, s_known_sha256[0])) {
+            gi.known_sha256 = (const uint8_t (*)[32])s_known_sha256;
+            gi.num_known_sha256 = 1;
+        }
     }
 
     /* Opt-in widescreen: expose the "Widescreen 16:9" toggle (drawn with an

@@ -699,6 +699,16 @@ static std::string rom_sha256_symbol_name(const GeneratorOptions& options) {
     return module_link_name(options, "expected_sha256");
 }
 
+/* [rom] patch_file is a path relative to the config (that is where the
+ * recompiler read it from at generation time). At RUNTIME the launcher looks
+ * it up next to the executable, so only the basename travels into the
+ * generated code — the game's build stages the file there. */
+static std::string runtime_patch_file_name(const GeneratorOptions& options) {
+    return options.patch_file.empty()
+               ? (options.output_prefix + ".bps")
+               : std::filesystem::path(options.patch_file).filename().string();
+}
+
 static std::string module_main_name(const GeneratorOptions& options) {
     return options.output_prefix + "_main";
 }
@@ -3616,14 +3626,7 @@ GeneratedOutput generate_output(const ir::Program& program,
     source_ss << "    /* Identity check: game_extras CRC hooks take precedence (multi- */\n";
     source_ss << "    /* revision allowance); otherwise the embedded SHA-256 of the */\n";
     source_ss << "    /* exact ROM this binary was recompiled from is enforced. */\n";
-    /* [rom] patch_file is a path relative to the config (that is where the
-     * recompiler read it from at generation time). At RUNTIME the launcher
-     * looks it up next to the executable, so only the basename travels into the
-     * generated code — the game's build stages the file there. */
-    const std::string patch_file =
-        options.patch_file.empty()
-            ? (options.output_prefix + ".bps")
-            : std::filesystem::path(options.patch_file).filename().string();
+    const std::string patch_file = runtime_patch_file_name(options);
     source_ss << "    launcher_init();\n";
     source_ss << "    launcher_set_expected_sha256(" << rom_sha256_symbol_name(options) << ");\n";
     if (!emits_body_descriptor(options)) {
@@ -3787,6 +3790,10 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "#include \"gbrt.h\"\n";
     main_ss << "#include \"audio.h\"\n";
     main_ss << "#include \"audio_stats.h\"\n";
+    if (!body_aware_main) {
+        main_ss << "#include \"launcher.h\"\n";
+        main_ss << "extern const char " << rom_sha256_symbol_name(options) << "[];\n";
+    }
     main_ss << "#ifdef GB_HAS_SDL2\n";
     main_ss << "#include <SDL.h>\n";
     main_ss << "#include \"platform_sdl.h\"\n";
@@ -4314,6 +4321,17 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "    if (benchmark_mode) {\n";
     main_ss << "        gb_platform_set_benchmark_mode(true);\n";
     main_ss << "    }\n";
+    if (!body_aware_main) {
+        /* The pre-boot launcher opens inside gb_platform_init() and marks the
+         * picked ROM verified, enabling Play, only when it is the one this
+         * binary was recompiled from. It needs the identity _init enforces
+         * before it opens, not after. */
+        main_ss << "    /* The pre-boot launcher (in gb_platform_init) checks the ROM */\n";
+        main_ss << "    /* against the same identity " << options.output_prefix << "_init enforces. */\n";
+        main_ss << "    launcher_init();\n";
+        main_ss << "    launcher_set_expected_sha256(" << rom_sha256_symbol_name(options) << ");\n";
+        main_ss << "    launcher_set_patch_file(\"" << runtime_patch_file_name(options) << "\");\n";
+    }
     main_ss << "    if (!gb_platform_init(5)) {\n";
     main_ss << "        fprintf(stderr, \"Failed to initialize platform\\n\");\n";
     main_ss << "        gb_context_destroy(ctx);\n";

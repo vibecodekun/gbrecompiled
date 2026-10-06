@@ -40,6 +40,15 @@ void launcher_set_expected_sha256(const char *hex);
 void launcher_set_patch_file(const char *filename);
 
 /**
+ * The SHA-256 (lowercase hex) launcher_get_rom_path() will demand of the ROM
+ * file exactly as picked, for the pre-boot launcher to check a pick against
+ * before Play. NULL when the digest is not what decides: CRC hooks take
+ * precedence, no digest is registered, or a shipped patch would let a stock
+ * ROM through by patching it.
+ */
+const char *launcher_identity_sha256(void);
+
+/**
  * Apply a BPS patch to an in-memory ROM image. Nothing is written to disk and
  * the caller's buffer is left untouched.
  *
