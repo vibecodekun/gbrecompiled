@@ -1029,7 +1029,8 @@ static void handle_window(int id, const char *json)
  * window, "shaders" it at Shader Presets, "none" closes them), set
  * {pause_in_menu} (0|1), {dim_percent} (Game Dimming) and {opacity_percent}
  * (Menu Opacity, 0-100), unsaved; absent leaves one as it is. {leave}: "quit"
- * or "launcher" does what the menus' Quit / Return to Launcher do. Then report
+ * or "launcher" does what the menus' Quit / Return to Launcher do (a paused
+ * runner leaves once it runs again; the last one decides). Then report
  * the menus and whether the game is held. Frames do not advance while it is
  * held, so `step` waits until the menu closes. */
 static void handle_menu(int id, const char *json)

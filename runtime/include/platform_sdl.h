@@ -269,7 +269,8 @@ void gb_platform_set_menu(const char* open, int pause_in_menu, int dim_percent, 
 void gb_platform_get_menu_info(GBPlatformMenuInfo* out);
 
 /* Leaves the game as the menus' Quit ("quit") or Return to Launcher
- * ("launcher") do. False for anything else. */
+ * ("launcher") do: the main loop ends at its next poll, and the last one asked
+ * for decides. False for anything else. */
 bool gb_platform_leave_game(const char* to);
 
 /* Queues window input as if the user gave it (the debug server's

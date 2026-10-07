@@ -357,6 +357,12 @@ static std::vector<uint32_t> g_sgb_cart_border_pixels;  /* scratch RGBA buffer *
 static bool g_sgb_cart_border_from_cache = false;
 static bool g_sgb_cart_border_cache_saved = false;
 static GBPlatformExitAction g_exit_action = GB_PLATFORM_EXIT_QUIT;
+/* The game is to end (Quit, Return to Launcher, the window closed):
+ * gb_platform_poll_events() ends the main loop. A flag, not an SDL_QUIT pushed
+ * back for it to find: SDL_PollEvent stops at the poll sentinel queued before
+ * the push, so the menu's hold caught that quit again every frame and the game
+ * ran on behind the menu until a second one was queued. */
+static bool g_quit_requested = false;
 /* Set by the Esc menu's "Restart Game" button; consumed by the launcher. */
 static bool g_restart_game_requested = false;
 static const char* g_palette_names[] = {
@@ -7008,6 +7014,7 @@ bool gb_platform_init(int scale) {
     g_windowed_height = GB_SCREEN_HEIGHT * g_scale;
     g_game_viewport = {0, 0, g_windowed_width, g_windowed_height};
     g_exit_action = GB_PLATFORM_EXIT_QUIT;
+    g_quit_requested = false;
     g_frame_count = 0;
     g_manual_joypad_buttons = 0xFF;
     g_manual_joypad_dpad = 0xFF;
@@ -7752,6 +7759,12 @@ bool gb_platform_poll_events(GBContext* ctx) {
 
     game_on_frame(ctx);
 
+    /* Asked for by a menu, the debug server or an event handled while
+     * gb_platform_vsync() waited. */
+    if (g_quit_requested) {
+        return false;
+    }
+
     SDL_Event event;
 
     if (!g_benchmark_mode) {
@@ -7760,7 +7773,7 @@ bool gb_platform_poll_events(GBContext* ctx) {
             if (ImGui::GetCurrentContext() != NULL) {
                 ImGui_ImplSDL2_ProcessEvent(&event);
             }
-            if (!handle_runtime_event(&event, ctx)) {
+            if (!handle_runtime_event(&event, ctx) || g_quit_requested) {
                 return false;
             }
         }
@@ -7833,10 +7846,8 @@ static void handle_events_before_frame(void) {
             ImGui_ImplSDL2_ProcessEvent(&event);
         }
         if (!handle_runtime_event(&event, g_registered_ctx)) {
-            /* Quit: let gb_platform_poll_events() see it and end the loop. */
-            SDL_Event quit_event = {};
-            quit_event.type = SDL_QUIT;
-            SDL_PushEvent(&quit_event);
+            /* Quit: gb_platform_poll_events() ends the loop. */
+            g_quit_requested = true;
             break;
         }
         handled = true;
@@ -7911,15 +7922,18 @@ uint8_t gb_platform_get_joypad(void) {
  * re-presenting it so the menus stay usable, and keeps handling events so
  * buttons held now are what the next frame reads. Returns true if it held,
  * once the menus are closed and the user resumes, advances one frame or steps
- * one back with Rewind. */
+ * one back with Rewind, or once the game is to end. */
 static bool paused_rewind_step_due(void);
 static bool wait_while_user_paused(void) {
     if (!g_user_paused && !menu_holds_game()) {
         return false;
     }
     uint64_t last_present_ms = 0;
-    while (menu_holds_game() ||
-           (g_user_paused && g_frame_advance_pending == 0 && !paused_rewind_step_due())) {
+    /* A menu's Quit / Return to Launcher (clicked while this presents) and the
+     * debug server's leave end the hold as well. */
+    while (!g_quit_requested &&
+           (menu_holds_game() ||
+            (g_user_paused && g_frame_advance_pending == 0 && !paused_rewind_step_due()))) {
         const uint64_t now_ms = SDL_GetTicks64();
         const uint64_t next_present_ms = last_present_ms + 16;
         SDL_Event event;
@@ -7930,10 +7944,8 @@ static bool wait_while_user_paused(void) {
                     ImGui_ImplSDL2_ProcessEvent(&event);
                 }
                 if (!handle_runtime_event(&event, g_registered_ctx)) {
-                    /* Quit: let gb_platform_poll_events() see it and end the loop. */
-                    SDL_Event quit_event = {};
-                    quit_event.type = SDL_QUIT;
-                    SDL_PushEvent(&quit_event);
+                    /* Quit: gb_platform_poll_events() ends the loop. */
+                    g_quit_requested = true;
                     return true;
                 }
             } while (SDL_PollEvent(&event));
@@ -8735,8 +8747,10 @@ static void run_pending_restart(void) {
  * takes exit code 64 back. The pre-boot launcher runs inside this program,
  * before the game, so returning to it starts the program again with the
  * launcher asked for, once this process has saved and closed (atexit runs
- * after main has destroyed the context, which writes the battery RAM). */
+ * after main has destroyed the context, which writes the battery RAM). The
+ * last leave asked for decides: Quit after Return to Launcher only quits. */
 static void relaunch_with_launcher(void) {
+    if (g_exit_action != GB_PLATFORM_EXIT_RETURN_TO_LAUNCHER) return;
     if (!gb_host_relaunch("GBRECOMP_LAUNCHER", "1", "GBRECOMP_NO_LAUNCHER")) {
         fprintf(stderr, "[SDL] Could not start the launcher again\n");
     }
@@ -8757,9 +8771,7 @@ static void request_exit(GBPlatformExitAction action) {
         if (!relaunch_registered) atexit(relaunch_with_launcher);
         relaunch_registered = true;
     }
-    SDL_Event quit_event = {};
-    quit_event.type = SDL_QUIT;
-    SDL_PushEvent(&quit_event);
+    g_quit_requested = true;
 }
 
 bool gb_platform_savestate_slot_path(const GBContext* ctx, int slot,
