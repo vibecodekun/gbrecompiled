@@ -172,7 +172,10 @@ do not finish until the menu closes.
   compositor is installed (`gb_custom_render`, width `gb_custom_width`),
   otherwise the native 160x144 framebuffer. `source` is `"presented"` when it
   came from the platform's present path and `"composed"` when it was built here
-  (headless run, or before the first present).
+  (headless run, or before the first present). A game's layer
+  (`gb_custom_layer`, such as a status bar at a size of its own) is drawn by the
+  window over the picture and is not in it; `window_screenshot` has it. Headless
+  there are no layers, and the game draws such rows into the picture itself.
 * Format follows the suffix: `.png` (case-insensitive) writes a real PNG via the
   vendored `stb_image_write`; anything else writes binary PPM (P6).
 * `recompose:1` re-runs the compositor against current VRAM/OAM instead of

@@ -145,6 +145,11 @@ typedef void (GL_APIENTRY* PFN_gbBindSampler)(GLuint unit, GLuint sampler);
 PFN_gbBindSampler g_bind_sampler = NULL;
 GLint g_sampler_units = 0;
 
+/* The output of the layer's chain (gb_lrs_render_layer). */
+GLuint g_layer_out_tex = 0;
+int g_layer_out_w = 0;
+int g_layer_out_h = 0;
+
 #ifdef GB_LRS_SUPPORTED
 libra_instance_t g_lr;
 libra_gl_filter_chain_t g_chain = NULL;
@@ -152,6 +157,15 @@ size_t g_frame = 0;
 Uint64 g_last_counter = 0;
 unsigned g_frame_failures = 0;
 unsigned g_gl_error_frames = 0;
+
+/* The running preset again for a layer over the game's picture, made the
+ * first time one is drawn: presets that keep past frames keep each picture's
+ * own. Failed when that did not work, until the next preset. */
+libra_gl_filter_chain_t g_layer_chain = NULL;
+bool g_layer_failed = false;
+size_t g_layer_frame = 0;
+Uint64 g_layer_last_counter = 0;
+bool g_layer_clear_history = false;
 
 /* librashader calls the loader as extern "system", which is __stdcall on
  * 32-bit x86; its header's libra_gl_loader_t names no convention (cdecl). */
@@ -187,6 +201,11 @@ std::string take_error(libra_error_t e, const char* what) {
 void chain_free(void) {
     if (g_chain) drop(g_lr.gl_filter_chain_free(&g_chain));
     g_chain = NULL;
+    if (g_layer_chain) drop(g_lr.gl_filter_chain_free(&g_layer_chain));
+    g_layer_chain = NULL;
+    g_layer_failed = false;
+    g_layer_frame = 0;
+    g_layer_last_counter = 0;
 }
 #endif
 
@@ -217,11 +236,11 @@ void restore_gl_state(void) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-bool ensure_output(int w, int h) {
-    if (g_out_tex && g_out_w == w && g_out_h == h) return true;
+bool ensure_texture(GLuint& tex, int& tex_w, int& tex_h, int w, int h) {
+    if (tex && tex_w == w && tex_h == h) return true;
     while (glGetError() != GL_NO_ERROR) {}
-    if (!g_out_tex) glGenTextures(1, &g_out_tex);
-    glBindTexture(GL_TEXTURE_2D, g_out_tex);
+    if (!tex) glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -230,12 +249,15 @@ bool ensure_output(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
     if (glGetError() != GL_NO_ERROR) {
-        g_out_w = g_out_h = 0;
+        tex_w = tex_h = 0;
         return false;
     }
-    g_out_w = w;
-    g_out_h = h;
+    tex_w = w;
+    tex_h = h;
     return true;
+}
+bool ensure_output(int w, int h) {
+    return ensure_texture(g_out_tex, g_out_w, g_out_h, w, h);
 }
 
 /* ---- declaration order ---------------------------------------------------
@@ -340,6 +362,105 @@ void republish_params(void) {
     }
 }
 
+#ifdef GB_LRS_SUPPORTED
+/* A chain for the preset at `path`, and its parameters when `params` is given
+ * (read before the chain is created, which consumes the preset; a preset
+ * without a readable list still runs). Sets *error on failure. */
+bool create_chain(const char* path, bool unoptimized, libra_gl_filter_chain_t* out, std::vector<Param>* params,
+                  std::string* error) {
+    libra_preset_ctx_t ctx = NULL;
+    drop(g_lr.preset_ctx_create(&ctx));
+    if (ctx) drop(g_lr.preset_ctx_set_runtime(&ctx, LIBRA_PRESET_CTX_RUNTIME_GL_CORE));
+
+    libra_preset_opt_t popt;
+    memset(&popt, 0, sizeof(popt));
+    popt.version = LIBRASHADER_CURRENT_VERSION;
+    popt.original_aspect_uniforms = true;   /* aspect_ratio 0 = the source's own */
+    popt.frametime_uniforms = true;         /* frames_per_second + frametime_delta are set */
+
+    libra_shader_preset_t preset = NULL;
+    libra_error_t e = g_lr.preset_create_with_options(path, ctx ? &ctx : NULL, &popt, &preset);
+    if (ctx) drop(g_lr.preset_ctx_free(&ctx));
+    if (e || !preset) {
+        *error = e ? take_error(e, "preset") : std::string("preset: could not read ") + path;
+        if (preset) drop(g_lr.preset_free(&preset));
+        return false;
+    }
+
+    if (params) {
+        libra_preset_param_list_t list;
+        memset(&list, 0, sizeof(list));
+        e = g_lr.preset_get_runtime_params(&preset, &list);
+        if (e) {
+            drop(e);
+        } else {
+            for (uint64_t i = 0; i < list.length; i++) {
+                const libra_preset_param_t& src = list.parameters[i];
+                Param p;
+                p.name = src.name ? src.name : "";
+                p.description = src.description ? src.description : p.name;
+                p.pub.minimum = src.minimum;
+                p.pub.maximum = src.maximum;
+                p.pub.step = src.step;
+                p.pub.initial = p.pub.value = src.initial;
+                params->push_back(std::move(p));
+            }
+            drop(g_lr.preset_free_runtime_params(list));
+        }
+    }
+
+    filter_chain_gl_opt_t copt;
+    memset(&copt, 0, sizeof(copt));
+    copt.version = LIBRASHADER_CURRENT_VERSION;
+    copt.glsl_version = 0;      /* from the context: GLSL ES 3.10 on ANGLE */
+    copt.use_dsa = false;       /* DSA is desktop GL 4.5 only */
+    copt.disable_cache = !g_disk_cache;
+    libra_gl_filter_chain_t chain = NULL;
+    g_compile_unoptimized = unoptimized;
+    if (unoptimized) fprintf(stderr, "[SHADER] %s: compiling without the HLSL optimizer\n", path);
+    e = g_lr.gl_filter_chain_create(&preset, (libra_gl_loader_t)gl_loader, &copt, &chain);
+    /* The create takes the preset whether or not it succeeds; free whatever is
+     * still ours rather than relying on which. */
+    if (preset) drop(g_lr.preset_free(&preset));
+    restore_gl_state();
+    if (e || !chain) {
+        *error = e ? take_error(e, "compile") : std::string("compile: librashader returned no chain");
+        return false;
+    }
+    *out = chain;
+    return true;
+}
+
+/* A frame's options for a chain reading src_tex, whose last frame was at
+ * *last_counter. */
+frame_gl_opt_t frame_options(GLuint src_tex, bool clear_history, Uint64& last_counter) {
+    /* librashader samples through sampler objects whose min filter is always a
+     * mipmap one, and a texture with only level 0 is incomplete under those:
+     * it reads as black. Capping the chain at level 0 makes it complete. Set
+     * every frame because the runtime recreates its texture on size changes. */
+    glBindTexture(GL_TEXTURE_2D, src_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    const Uint64 now = SDL_GetPerformanceCounter();
+    const Uint64 delta = last_counter ? now - last_counter : 0;
+    last_counter = now;
+
+    frame_gl_opt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.version = LIBRASHADER_CURRENT_VERSION;
+    opt.clear_history = clear_history;
+    opt.frame_direction = 1;
+    opt.total_subframes = 1;
+    opt.current_subframe = 1;
+    opt.aspect_ratio = 0.0f;                   /* the source's own: GB pixels are square */
+    opt.frames_per_second = 4194304.0f / 70224.0f;
+    opt.frametime_delta = (uint32_t)(delta * 1000 / SDL_GetPerformanceFrequency());
+    opt.brightness_nits = 200.0f;
+    return opt;
+}
+#endif
+
 }  /* anonymous namespace */
 
 extern "C" {
@@ -418,66 +539,12 @@ bool gb_lrs_load(const char* path, bool unoptimized) {
     }
 
     const Uint64 load_started = SDL_GetPerformanceCounter();
-    libra_preset_ctx_t ctx = NULL;
-    drop(g_lr.preset_ctx_create(&ctx));
-    if (ctx) drop(g_lr.preset_ctx_set_runtime(&ctx, LIBRA_PRESET_CTX_RUNTIME_GL_CORE));
-
-    libra_preset_opt_t popt;
-    memset(&popt, 0, sizeof(popt));
-    popt.version = LIBRASHADER_CURRENT_VERSION;
-    popt.original_aspect_uniforms = true;   /* aspect_ratio 0 = the source's own */
-    popt.frametime_uniforms = true;         /* frames_per_second + frametime_delta are set */
-
-    libra_shader_preset_t preset = NULL;
-    libra_error_t e = g_lr.preset_create_with_options(path, ctx ? &ctx : NULL, &popt, &preset);
-    if (ctx) drop(g_lr.preset_ctx_free(&ctx));
-    if (e || !preset) {
-        g_error = e ? take_error(e, "preset") : std::string("preset: could not read ") + path;
-        if (preset) drop(g_lr.preset_free(&preset));
-        fprintf(stderr, "[SHADER] %s: %s\n", path, g_error.c_str());
-        return false;
-    }
-
-    /* Parameters must be read before the chain is created, which consumes the
-     * preset. A preset without a readable list still runs. */
     std::vector<Param> params;
-    libra_preset_param_list_t list;
-    memset(&list, 0, sizeof(list));
-    e = g_lr.preset_get_runtime_params(&preset, &list);
-    if (e) {
-        drop(e);
-    } else {
-        for (uint64_t i = 0; i < list.length; i++) {
-            const libra_preset_param_t& src = list.parameters[i];
-            Param p;
-            p.name = src.name ? src.name : "";
-            p.description = src.description ? src.description : p.name;
-            p.pub.minimum = src.minimum;
-            p.pub.maximum = src.maximum;
-            p.pub.step = src.step;
-            p.pub.initial = p.pub.value = src.initial;
-            params.push_back(std::move(p));
-        }
-        drop(g_lr.preset_free_runtime_params(list));
-    }
-
-    filter_chain_gl_opt_t copt;
-    memset(&copt, 0, sizeof(copt));
-    copt.version = LIBRASHADER_CURRENT_VERSION;
-    copt.glsl_version = 0;      /* from the context: GLSL ES 3.10 on ANGLE */
-    copt.use_dsa = false;       /* DSA is desktop GL 4.5 only */
-    copt.disable_cache = !g_disk_cache;
     libra_gl_filter_chain_t chain = NULL;
-    g_compile_unoptimized = unoptimized;
-    if (unoptimized) fprintf(stderr, "[SHADER] %s: compiling without the HLSL optimizer\n", path);
-    e = g_lr.gl_filter_chain_create(&preset, (libra_gl_loader_t)gl_loader, &copt, &chain);
-    /* The create takes the preset whether or not it succeeds; free whatever is
-     * still ours rather than relying on which. */
-    if (preset) drop(g_lr.preset_free(&preset));
-    restore_gl_state();
-    if (e || !chain) {
+    std::string error;
+    if (!create_chain(path, unoptimized, &chain, &params, &error)) {
         g_compile_unoptimized = g_chain_unoptimized;
-        g_error = e ? take_error(e, "compile") : std::string("compile: librashader returned no chain");
+        g_error = error;
         fprintf(stderr, "[SHADER] %s: %s\n", path, g_error.c_str());
         return false;
     }
@@ -490,7 +557,7 @@ bool gb_lrs_load(const char* path, bool unoptimized) {
     g_params = std::move(params);
     for (Param& p : g_params) {
         float v = 0.0f;
-        e = g_lr.gl_filter_chain_get_param(&g_chain, p.name.c_str(), &v);
+        libra_error_t e = g_lr.gl_filter_chain_get_param(&g_chain, p.name.c_str(), &v);
         if (e) drop(e);
         else p.pub.initial = p.pub.value = v;
     }
@@ -528,31 +595,9 @@ unsigned gb_lrs_render(unsigned src_tex, int src_w, int src_h, int out_w, int ou
     if (!g_chain || !src_tex || src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0) return 0;
     if (!ensure_output(out_w, out_h)) return 0;
 
-    /* librashader samples through sampler objects whose min filter is always a
-     * mipmap one, and a texture with only level 0 is incomplete under those:
-     * it reads as black. Capping the chain at level 0 makes it complete. Set
-     * every frame because the runtime recreates its texture on size changes. */
-    glBindTexture(GL_TEXTURE_2D, src_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    const Uint64 now = SDL_GetPerformanceCounter();
-    const Uint64 delta = g_last_counter ? now - g_last_counter : 0;
-    g_last_counter = now;
-
     libra_image_gl_t in = { src_tex, GL_RGBA8, (uint32_t)src_w, (uint32_t)src_h };
     libra_image_gl_t out = { g_out_tex, GL_RGBA8, (uint32_t)out_w, (uint32_t)out_h };
-    frame_gl_opt_t opt;
-    memset(&opt, 0, sizeof(opt));
-    opt.version = LIBRASHADER_CURRENT_VERSION;
-    opt.clear_history = g_clear_history;
-    opt.frame_direction = 1;
-    opt.total_subframes = 1;
-    opt.current_subframe = 1;
-    opt.aspect_ratio = 0.0f;                   /* the source's own: GB pixels are square */
-    opt.frames_per_second = 4194304.0f / 70224.0f;
-    opt.frametime_delta = (uint32_t)(delta * 1000 / SDL_GetPerformanceFrequency());
-    opt.brightness_nits = 200.0f;
+    const frame_gl_opt_t opt = frame_options(src_tex, g_clear_history, g_last_counter);
 
     /* NULL viewport and MVP: the whole output texture, librashader's default
      * projection. */
@@ -586,8 +631,53 @@ unsigned gb_lrs_render(unsigned src_tex, int src_w, int src_h, int out_w, int ou
 #endif
 }
 
+unsigned gb_lrs_render_layer(unsigned src_tex, int src_w, int src_h, int out_w, int out_h) {
+#ifdef GB_LRS_SUPPORTED
+    if (!g_chain || g_layer_failed || !src_tex || src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0) return 0;
+    if (!g_layer_chain) {
+        const Uint64 started = SDL_GetPerformanceCounter();
+        std::string error;
+        if (!create_chain(g_path.c_str(), g_chain_unoptimized, &g_layer_chain, NULL, &error)) {
+            g_layer_chain = NULL;
+            g_layer_failed = true;
+            fprintf(stderr, "[SHADER] layer: %s\n", error.c_str());
+            return 0;
+        }
+        for (const Param& p : g_params)
+            drop(g_lr.gl_filter_chain_set_param(&g_layer_chain, p.name.c_str(), p.pub.value));
+        g_layer_frame = 0;
+        g_layer_last_counter = 0;
+        g_layer_clear_history = false;
+        fprintf(stderr, "[SHADER] layer chain for %s in %.0f ms\n", g_path.c_str(),
+                (double)(SDL_GetPerformanceCounter() - started) * 1000.0 / (double)SDL_GetPerformanceFrequency());
+    }
+    if (!ensure_texture(g_layer_out_tex, g_layer_out_w, g_layer_out_h, out_w, out_h)) return 0;
+    libra_image_gl_t in = { src_tex, GL_RGBA8, (uint32_t)src_w, (uint32_t)src_h };
+    libra_image_gl_t out = { g_layer_out_tex, GL_RGBA8, (uint32_t)out_w, (uint32_t)out_h };
+    const frame_gl_opt_t opt = frame_options(src_tex, g_layer_clear_history, g_layer_last_counter);
+    while (glGetError() != GL_NO_ERROR) {}
+    libra_error_t e = g_lr.gl_filter_chain_frame(&g_layer_chain, g_layer_frame, in, out, NULL, NULL, &opt);
+    restore_gl_state();
+    if (e) {
+        /* The runtime draws the layer with its built-in shader from then on. */
+        fprintf(stderr, "[SHADER] layer: %s\n", take_error(e, "frame").c_str());
+        g_layer_failed = true;
+        return 0;
+    }
+    g_layer_frame++;
+    g_layer_clear_history = false;
+    return g_layer_out_tex;
+#else
+    (void)src_tex; (void)src_w; (void)src_h; (void)out_w; (void)out_h;
+    return 0;
+#endif
+}
+
 void gb_lrs_clear_history(void) {
     g_clear_history = true;
+#ifdef GB_LRS_SUPPORTED
+    g_layer_clear_history = true;
+#endif
 }
 
 int gb_lrs_param_count(void) { return (int)g_params.size(); }
@@ -615,6 +705,8 @@ bool gb_lrs_set_param(int index, float value) {
         drop(e);
         return false;
     }
+    if (g_layer_chain)
+        drop(g_lr.gl_filter_chain_set_param(&g_layer_chain, g_params[(size_t)index].name.c_str(), value));
     p.value = value;
     return true;
 #else
@@ -945,6 +1037,11 @@ void gb_lrs_shutdown(void) {
         g_out_tex = 0;
     }
     g_out_w = g_out_h = 0;
+    if (g_layer_out_tex) {
+        glDeleteTextures(1, &g_layer_out_tex);
+        g_layer_out_tex = 0;
+    }
+    g_layer_out_w = g_layer_out_h = 0;
 }
 
 }  /* extern "C" */

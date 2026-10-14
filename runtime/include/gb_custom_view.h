@@ -40,9 +40,10 @@ extern int gb_custom_view_width;
 extern int gb_custom_view_height;
 /* Optional, called before each frame is rendered: *width x *height holds the
  * resolved view, which the game may shrink to the part of the world worth
- * showing (a room smaller than the view), and *scale, 0 on entry, may be set
- * to present it at that many window pixels per game pixel instead of by the
- * platform's scaling mode. whole_pixels is set for Pixel Perfect scaling. */
+ * showing (a room smaller than the view; at least 160 wide, but it may be
+ * fewer than 144 rows), and *scale, 0 on entry, may be set to present it at
+ * that many window pixels per game pixel instead of by the platform's
+ * scaling mode. whole_pixels is set for Pixel Perfect scaling. */
 typedef void (*GBCustomFit)(struct GBContext *, int window_w, int window_h, int whole_pixels,
                             int *width, int *height, double *scale);
 extern GBCustomFit gb_custom_fit;
@@ -70,6 +71,20 @@ enum {
 };
 extern int gb_custom_native_scaling;
 extern int gb_custom_native_scale;
+/* A layer over the bottom of the view, such as a status bar or dialogue box
+ * shown at a size of its own: gb_custom_layer_width x gb_custom_layer_height
+ * pixels drawn through the shader chain (a chain of its own) at
+ * gb_custom_layer_scale window pixels per pixel, centered across the bottom
+ * of the presented picture. The render callback sets it for each frame it
+ * draws (scale 0: none) and keeps the picture's rows under it for it. The
+ * platform sets gb_custom_layers before gb_custom_fit to say whether it can
+ * draw one this frame (a preset that draws a bezel over the whole window
+ * cannot); where it cannot, the game draws those rows itself. */
+extern const uint32_t *gb_custom_layer;
+extern int gb_custom_layer_width;
+extern int gb_custom_layer_height;
+extern double gb_custom_layer_scale;
+extern int gb_custom_layers;
 /* Render the view into out; 0, drawing nothing, when the game declines the
  * frame and the native picture is shown instead. */
 int gb_custom_draw_frame(struct GBContext *, uint32_t *out, int width, const uint32_t *native);

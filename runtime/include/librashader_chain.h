@@ -58,8 +58,17 @@ const char* gb_lrs_error(void);     /* last load or frame error, or "" */
  * bound; the viewport is the caller's to reset. */
 unsigned gb_lrs_render(unsigned src_tex, int src_w, int src_h, int out_w, int out_h);
 
+/* The same for a second picture drawn over the game's, a game's layer
+ * (gb_custom_layer: a status bar or dialogue box at a size of its own),
+ * through a chain of its own so presets that keep past frames keep each
+ * picture's. The chain is made from the running preset the first time; 0
+ * when there is no preset or the chain could not be made or run (the caller
+ * draws unshaded). */
+unsigned gb_lrs_render_layer(unsigned src_tex, int src_w, int src_h, int out_w, int out_h);
+
 /* Drop history and feedback frames on the next render (after a state load,
- * so a CRT preset's persistence does not bleed the old scene through). */
+ * so a CRT preset's persistence does not bleed the old scene through), the
+ * layer's too. */
 void gb_lrs_clear_history(void);
 
 /* Parameters of the running preset, in the order the shaders declare them. */

@@ -47,16 +47,25 @@ void gb_custom_resolve_size(int window_w, int window_h, int whole_pixels,
 }
 int gb_custom_native_scaling = GB_CUSTOM_NATIVE_IN_VIEW;
 int gb_custom_native_scale = 1;
+const uint32_t *gb_custom_layer;
+int gb_custom_layer_width;
+int gb_custom_layer_height;
+double gb_custom_layer_scale;
+int gb_custom_layers;
 int gb_custom_draw_frame(struct GBContext *ctx, uint32_t *out, int width, const uint32_t *native) {
     return gb_custom_render && gb_custom_render(ctx, out, width, native);
 }
 void gb_custom_center_native(uint32_t *out, int width, const uint32_t *native, int native_width) {
     for (size_t i = 0; i < (size_t)width * gb_custom_height; ++i) out[i] = 0xff000000u;
     int copy_width = native_width < width ? native_width : width;
-    for (int y = 0; y < 144; ++y)
-        memcpy(out + (size_t)(y + (gb_custom_height - 144) / 2) * width + (width - copy_width) / 2,
+    /* A picture shorter than the screen (gb_custom_fit) keeps its middle. */
+    const int top = (gb_custom_height - 144) / 2;
+    for (int y = 0; y < 144; ++y) {
+        if (y + top < 0 || y + top >= gb_custom_height) continue;
+        memcpy(out + (size_t)(y + top) * width + (width - copy_width) / 2,
                native + y * native_width + (native_width - copy_width) / 2,
                (size_t)copy_width * sizeof(uint32_t));
+    }
 }
 int gb_custom_compose_frame(struct GBContext *ctx, uint32_t *out, int width,
                             const uint32_t *native, int native_width) {

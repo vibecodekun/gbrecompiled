@@ -88,6 +88,9 @@ static constexpr const char* GB_BORDER_DIR_NAME = "borders";
 static SDL_Window* g_window = NULL;
 static SDL_GLContext g_gl_context = NULL;
 static GLuint g_game_tex = 0;
+/* The game's layer over its picture (gb_custom_layer) and its size. */
+static GLuint g_layer_tex = 0;
+static int g_layer_tex_w = 0, g_layer_tex_h = 0;
 static GBShaderPipeline* g_shader_pipeline = NULL;
 static std::string g_active_shader_pref = "sharp";
 
@@ -4623,6 +4626,110 @@ static bool fast_forward_frame_due(void) {
     return render;
 }
 
+/* The PPU's 0xAARRGGBB pixels as RGBA for GL, with the present-time screen
+ * color LUT, the palette override and the color correction applied. The
+ * game picture and a game's layer (gb_custom_layer) both go through it. */
+static void convert_for_upload(const uint32_t* framebuffer, int width, int height,
+                               std::vector<uint32_t>& out) {
+    const uint32_t* src = framebuffer;
+    const size_t frame_pixels = (size_t)width * height;
+    out.resize(frame_pixels);
+    /* Present-time screen-color LUT (opt-in via GBCRECOMP_SCREEN; default
+     * raw => NULL => passthrough, byte-identical). Map the ARGB framebuffer
+     * into a scratch copy that feeds the RGBA repack below; never mutates
+     * the PPU framebuffer or the verify path. */
+    if (!g_color_lut_resolved) {
+        g_color_lut = color_lut_create_from_env();
+        g_color_lut_resolved = true;
+    }
+    if (g_color_lut && !color_lut_is_passthrough(g_color_lut)) {
+        static std::vector<uint32_t> s_lut_buf;
+        s_lut_buf.resize(frame_pixels);
+        color_lut_map_argb8888(g_color_lut, framebuffer, s_lut_buf.data(),
+                               width, height);
+        src = s_lut_buf.data();
+    }
+    /* Match the actual post-conversion DMG-green values produced by
+     * ppu.c's rgb555_to_rgba (which uses *255/31 with integer
+     * truncation), not the dmg_palette_rgba constants — those are
+     * only used directly on the very first reset frame, every other
+     * frame goes through the rgb555 round-trip and lands a few LSBs
+     * away. Comparing against the wrong constants made the palette
+     * dropdown a silent no-op. */
+    const uint32_t orig[4] = { 0xFFE6F6CDu, 0xFF73BD62u, 0xFF319C52u, 0xFF081010u };
+    const uint32_t* pal = (g_palette_idx == 0) ? NULL : g_palettes[g_palette_idx];
+
+    /* Color correction matrices applied per-pixel.
+     *
+     *   GBC mode: viewing original-CGB-cartridge output on a modern
+     *   sRGB display. Real CGB LCDs had crushed saturation; the cart
+     *   art was tuned for that. Modern displays show those values
+     *   too vibrantly, so we desaturate slightly.
+     *
+     *   GBA mode: the AGB LCD was darker and bluer than the CGB
+     *   LCD. Games shipped for GBC look oversaturated on a real
+     *   GBA. This matrix gives the on-GBA look back. From mGBA's
+     *   GBA color correction; gamma is approximated as a linear
+     *   scale to keep this in integer math.
+     *
+     * Both matrices are normalized so the [0..255] output range
+     * stays in bounds. Coefficients * 1024 to fit uint16 multiply. */
+    static const int16_t cc_gbc[9] = {
+        /*  R from R,G,B   G from R,G,B   B from R,G,B */
+          893, 123,   8,    102,  840,  82,    102,  133,  789,
+    };
+    static const int16_t cc_gba[9] = {
+          860, 169,  -5,     92,  676, 256,     92,  261,  671,
+    };
+    const int16_t* cc = (g_color_correction == 1) ? cc_gbc :
+                        (g_color_correction == 2) ? cc_gba : NULL;
+
+    /* Neither palette nor correction (the usual case): the swap alone,
+     * four pixels at a time. A 1920x1080 view is 2 million pixels. */
+    size_t first = 0;
+    if (!pal && !cc) {
+        uint32_t* dst = out.data();
+#if defined(__SSE2__)
+        const __m128i alpha_green = _mm_set1_epi32((int)0xFF00FF00u);
+        for (; first + 4 <= frame_pixels; first += 4) {
+            const __m128i c = _mm_loadu_si128((const __m128i*)(src + first));
+            /* 00RR00BB -> 00BB00RR: swap the 16-bit halves. */
+            __m128i rb = _mm_andnot_si128(alpha_green, c);
+            rb = _mm_shufflehi_epi16(_mm_shufflelo_epi16(rb, 0xB1), 0xB1);
+            _mm_storeu_si128((__m128i*)(dst + first), _mm_or_si128(_mm_and_si128(c, alpha_green), rb));
+        }
+#endif
+        for (; first < frame_pixels; first++) {
+            const uint32_t c = src[first];
+            dst[first] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
+        }
+    }
+    for (size_t i = first; i < frame_pixels; i++) {
+        uint32_t c = src[i];
+        if (pal) {
+            if      (c == orig[0]) c = pal[0];
+            else if (c == orig[1]) c = pal[1];
+            else if (c == orig[2]) c = pal[2];
+            else if (c == orig[3]) c = pal[3];
+        }
+        uint32_t a = c & 0xFF000000u;
+        uint32_t r = (c >> 16) & 0xFFu;
+        uint32_t g = (c >>  8) & 0xFFu;
+        uint32_t b =  c        & 0xFFu;
+        if (cc) {
+            int rn = ((int)r * cc[0] + (int)g * cc[1] + (int)b * cc[2]) >> 10;
+            int gn = ((int)r * cc[3] + (int)g * cc[4] + (int)b * cc[5]) >> 10;
+            int bn = ((int)r * cc[6] + (int)g * cc[7] + (int)b * cc[8]) >> 10;
+            if (rn < 0) rn = 0; else if (rn > 255) rn = 255;
+            if (gn < 0) gn = 0; else if (gn > 255) gn = 255;
+            if (bn < 0) bn = 0; else if (bn > 255) bn = 255;
+            r = (uint32_t)rn; g = (uint32_t)gn; b = (uint32_t)bn;
+        }
+        /* ARGB → RGBA: swap R<->B, keep G and A. */
+        out[i] = a | (b << 16) | (g << 8) | r;
+    }
+}
+
 static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_frame) {
     if (!framebuffer) {
         DBG_FRAME("Platform render_frame: SKIPPED (null: tex=%d, gl=%d, fb=%d)",
@@ -4663,12 +4770,17 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         gb_custom_view_width = width;
         gb_custom_view_height = height;
         /* The game may show less of the world than the view (a room smaller
-         * than it), at a scale of its own. */
+         * than it), at a scale of its own. It may also hand over a layer for
+         * the bottom of its picture, which a window can draw unless a preset
+         * draws a bezel over the whole of it; headless there is no window. */
         double scale = 0.0;
+        gb_custom_layers = g_gl_context && !g_benchmark_mode && g_shader_pipeline &&
+                           !(gb_lrs_active() && g_slang_fill_window);
+        gb_custom_layer_scale = 0.0;
         if (gb_custom_fit) {
             gb_custom_fit(g_registered_ctx, ww, wh, whole_pixels, &width, &height, &scale);
             width = std::max(GB_SCREEN_WIDTH, std::min(width, gb_custom_view_width));
-            height = std::max(GB_SCREEN_HEIGHT, std::min(height, gb_custom_view_height));
+            height = std::max(1, std::min(height, gb_custom_view_height));
         }
         gb_custom_width = width;
         gb_custom_height = height;
@@ -4779,106 +4891,8 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
      * override (Original / Pocket / Plasma) is applied during the same
      * pass since we're touching every pixel anyway. */
     double upload_start_ms = sdl_now_ms();
-    const size_t frame_pixels = (size_t)presentation_width() * presentation_height();
     static std::vector<uint32_t> s_upload_buf;
-    s_upload_buf.resize(frame_pixels);
-    {
-        const uint32_t* src = framebuffer;
-        /* Present-time screen-color LUT (opt-in via GBCRECOMP_SCREEN; default
-         * raw => NULL => passthrough, byte-identical). Map the ARGB framebuffer
-         * into a scratch copy that feeds the RGBA repack below; never mutates
-         * the PPU framebuffer or the verify path. */
-        if (!g_color_lut_resolved) {
-            g_color_lut = color_lut_create_from_env();
-            g_color_lut_resolved = true;
-        }
-        if (g_color_lut && !color_lut_is_passthrough(g_color_lut)) {
-            static std::vector<uint32_t> s_lut_buf;
-            s_lut_buf.resize(frame_pixels);
-            color_lut_map_argb8888(g_color_lut, framebuffer, s_lut_buf.data(),
-                                   presentation_width(), presentation_height());
-            src = s_lut_buf.data();
-        }
-        /* Match the actual post-conversion DMG-green values produced by
-         * ppu.c's rgb555_to_rgba (which uses *255/31 with integer
-         * truncation), not the dmg_palette_rgba constants — those are
-         * only used directly on the very first reset frame, every other
-         * frame goes through the rgb555 round-trip and lands a few LSBs
-         * away. Comparing against the wrong constants made the palette
-         * dropdown a silent no-op. */
-        const uint32_t orig[4] = { 0xFFE6F6CDu, 0xFF73BD62u, 0xFF319C52u, 0xFF081010u };
-        const uint32_t* pal = (g_palette_idx == 0) ? NULL : g_palettes[g_palette_idx];
-
-        /* Color correction matrices applied per-pixel.
-         *
-         *   GBC mode: viewing original-CGB-cartridge output on a modern
-         *   sRGB display. Real CGB LCDs had crushed saturation; the cart
-         *   art was tuned for that. Modern displays show those values
-         *   too vibrantly, so we desaturate slightly.
-         *
-         *   GBA mode: the AGB LCD was darker and bluer than the CGB
-         *   LCD. Games shipped for GBC look oversaturated on a real
-         *   GBA. This matrix gives the on-GBA look back. From mGBA's
-         *   GBA color correction; gamma is approximated as a linear
-         *   scale to keep this in integer math.
-         *
-         * Both matrices are normalized so the [0..255] output range
-         * stays in bounds. Coefficients * 1024 to fit uint16 multiply. */
-        static const int16_t cc_gbc[9] = {
-            /*  R from R,G,B   G from R,G,B   B from R,G,B */
-              893, 123,   8,    102,  840,  82,    102,  133,  789,
-        };
-        static const int16_t cc_gba[9] = {
-              860, 169,  -5,     92,  676, 256,     92,  261,  671,
-        };
-        const int16_t* cc = (g_color_correction == 1) ? cc_gbc :
-                            (g_color_correction == 2) ? cc_gba : NULL;
-
-        /* Neither palette nor correction (the usual case): the swap alone,
-         * four pixels at a time. A 1920x1080 view is 2 million pixels. */
-        size_t first = 0;
-        if (!pal && !cc) {
-            uint32_t* dst = s_upload_buf.data();
-#if defined(__SSE2__)
-            const __m128i alpha_green = _mm_set1_epi32((int)0xFF00FF00u);
-            for (; first + 4 <= frame_pixels; first += 4) {
-                const __m128i c = _mm_loadu_si128((const __m128i*)(src + first));
-                /* 00RR00BB -> 00BB00RR: swap the 16-bit halves. */
-                __m128i rb = _mm_andnot_si128(alpha_green, c);
-                rb = _mm_shufflehi_epi16(_mm_shufflelo_epi16(rb, 0xB1), 0xB1);
-                _mm_storeu_si128((__m128i*)(dst + first), _mm_or_si128(_mm_and_si128(c, alpha_green), rb));
-            }
-#endif
-            for (; first < frame_pixels; first++) {
-                const uint32_t c = src[first];
-                dst[first] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
-            }
-        }
-        for (size_t i = first; i < frame_pixels; i++) {
-            uint32_t c = src[i];
-            if (pal) {
-                if      (c == orig[0]) c = pal[0];
-                else if (c == orig[1]) c = pal[1];
-                else if (c == orig[2]) c = pal[2];
-                else if (c == orig[3]) c = pal[3];
-            }
-            uint32_t a = c & 0xFF000000u;
-            uint32_t r = (c >> 16) & 0xFFu;
-            uint32_t g = (c >>  8) & 0xFFu;
-            uint32_t b =  c        & 0xFFu;
-            if (cc) {
-                int rn = ((int)r * cc[0] + (int)g * cc[1] + (int)b * cc[2]) >> 10;
-                int gn = ((int)r * cc[3] + (int)g * cc[4] + (int)b * cc[5]) >> 10;
-                int bn = ((int)r * cc[6] + (int)g * cc[7] + (int)b * cc[8]) >> 10;
-                if (rn < 0) rn = 0; else if (rn > 255) rn = 255;
-                if (gn < 0) gn = 0; else if (gn > 255) gn = 255;
-                if (bn < 0) bn = 0; else if (bn > 255) bn = 255;
-                r = (uint32_t)rn; g = (uint32_t)gn; b = (uint32_t)bn;
-            }
-            /* ARGB → RGBA: swap R<->B, keep G and A. */
-            s_upload_buf[i] = a | (b << 16) | (g << 8) | r;
-        }
-    }
+    convert_for_upload(framebuffer, presentation_width(), presentation_height(), s_upload_buf);
     glBindTexture(GL_TEXTURE_2D, g_game_tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                     presentation_width(), presentation_height(),
@@ -4972,6 +4986,44 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
             draw_game(gb_x, gb_y, gb_w, gb_h, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT);
         } else {
             draw_game(vp_x, vp_y, vp_w, vp_h, presentation_width(), presentation_height());
+        }
+        /* The game's layer (gb_custom_layer) over the bottom of its picture,
+         * centered across, at its own scale and through a chain of its own:
+         * a preset that works per game pixel works per layer pixel. */
+        const int lw = gb_custom_layer_width, lh = gb_custom_layer_height;
+        if (!g_native_presented && gb_custom_layers && gb_custom_layer && gb_custom_layer_scale > 0.0 &&
+            lw > 0 && lh > 0 && lw <= GB_CUSTOM_MAX_WIDTH && lh <= GB_CUSTOM_MAX_HEIGHT) {
+            static std::vector<uint32_t> s_layer_buf;
+            convert_for_upload(gb_custom_layer, lw, lh, s_layer_buf);
+            if (!g_layer_tex || g_layer_tex_w != lw || g_layer_tex_h != lh) {
+                if (!g_layer_tex) glGenTextures(1, &g_layer_tex);
+                glBindTexture(GL_TEXTURE_2D, g_layer_tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                g_layer_tex_w = lw;
+                g_layer_tex_h = lh;
+            }
+            glBindTexture(GL_TEXTURE_2D, g_layer_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, lw, lh, GL_RGBA, GL_UNSIGNED_BYTE, s_layer_buf.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            const int w = (int)(lw * gb_custom_layer_scale * dpr_x + 0.5);
+            const int h = (int)(lh * gb_custom_layer_scale * dpr_y + 0.5);
+            const int x = vp_x + (vp_w - w) / 2, y = vp_y + vp_h - h;
+            const GLuint shaded = gb_lrs_active() ? gb_lrs_render_layer(g_layer_tex, lw, lh, w, h) : 0;
+            const int active_shader = gb_shader_pipeline_active(g_shader_pipeline);
+            if (shaded) {
+                glViewport(0, 0, draw_w, draw_h);
+                glDisable(GL_BLEND);
+                gb_shader_pipeline_set_active_by_name(g_shader_pipeline, "sharp");
+                gb_shader_pipeline_draw(g_shader_pipeline, shaded, w, h, x, y, w, h, draw_w, draw_h);
+                if (active_shader >= 0) gb_shader_pipeline_set_active(g_shader_pipeline, active_shader);
+                glEnable(GL_BLEND);
+            } else {
+                gb_shader_pipeline_draw(g_shader_pipeline, g_layer_tex, lw, lh, x, y, w, h, draw_w, draw_h);
+            }
         }
     }
 
@@ -6485,6 +6537,11 @@ void gb_platform_shutdown(void) {
     if (g_game_tex) {
         glDeleteTextures(1, &g_game_tex);
         g_game_tex = 0;
+    }
+    if (g_layer_tex) {
+        glDeleteTextures(1, &g_layer_tex);
+        g_layer_tex = 0;
+        g_layer_tex_w = g_layer_tex_h = 0;
     }
     unload_border_texture();
     unload_sgb_cart_border_texture();
