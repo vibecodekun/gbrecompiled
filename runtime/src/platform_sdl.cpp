@@ -485,7 +485,7 @@ static const uint32_t g_palettes[][4] = {
     { 0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000 }, // B&W
     { 0xFFFFB000, 0xFFCB4F0E, 0xFF800000, 0xFF330000 }, // Amber (Phosphor)
 };
-static std::vector<uint32_t> g_custom_framebuffer;   /* sized to the resolved view */
+static std::vector<uint32_t> g_custom_framebuffer;   /* sized to the picture gb_custom_fit resolves */
 /* The custom view's native picture presented on its own this frame, scaled to
  * the window by gb_custom_native_scaling instead of centered in the view. */
 static bool g_native_presented = false;
@@ -4770,17 +4770,18 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         gb_custom_view_width = width;
         gb_custom_view_height = height;
         /* The game may show less of the world than the view (a room smaller
-         * than it), at a scale of its own. It may also hand over a layer for
-         * the bottom of its picture, which a window can draw unless a preset
-         * draws a bezel over the whole of it; headless there is no window. */
+         * than it), or more around it to make room for its bottom UI, at a
+         * scale of its own. It may also hand over a layer for the bottom of
+         * its picture, which a window can draw unless a preset draws a bezel
+         * over the whole of it; headless there is no window. */
         double scale = 0.0;
         gb_custom_layers = g_gl_context && !g_benchmark_mode && g_shader_pipeline &&
                            !(gb_lrs_active() && g_slang_fill_window);
         gb_custom_layer_scale = 0.0;
         if (gb_custom_fit) {
             gb_custom_fit(g_registered_ctx, ww, wh, whole_pixels, &width, &height, &scale);
-            width = std::max(GB_SCREEN_WIDTH, std::min(width, gb_custom_view_width));
-            height = std::max(1, std::min(height, gb_custom_view_height));
+            width = std::max(GB_SCREEN_WIDTH, std::min(width, GB_CUSTOM_MAX_WIDTH));
+            height = std::max(1, std::min(height, GB_CUSTOM_MAX_HEIGHT));
         }
         gb_custom_width = width;
         gb_custom_height = height;

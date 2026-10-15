@@ -31,7 +31,7 @@ extern int gb_custom_requested_width;
 extern int gb_custom_requested_height;
 /* The resolved size of the presented frame. Existing renderers default to 144
  * rows; custom render callbacks may use gb_custom_height for their row count.
- * A gb_custom_fit hook can make it smaller than the view below. */
+ * A gb_custom_fit hook can make it smaller or larger than the view below. */
 extern int gb_custom_width;
 extern int gb_custom_height;
 /* The view resolved for the window before gb_custom_fit (the window's size and
@@ -41,9 +41,11 @@ extern int gb_custom_view_height;
 /* Optional, called before each frame is rendered: *width x *height holds the
  * resolved view, which the game may shrink to the part of the world worth
  * showing (a room smaller than the view; at least 160 wide, but it may be
- * fewer than 144 rows), and *scale, 0 on entry, may be set to present it at
- * that many window pixels per game pixel instead of by the platform's
- * scaling mode. whole_pixels is set for Pixel Perfect scaling. */
+ * fewer than 144 rows) or grow, up to the maximum, to show more around it
+ * (room for a bottom UI larger than its own pixels), and *scale, 0 on entry,
+ * may be set to present it at that many window pixels per game pixel instead
+ * of by the platform's scaling mode. whole_pixels is set for Pixel Perfect
+ * scaling. */
 typedef void (*GBCustomFit)(struct GBContext *, int window_w, int window_h, int whole_pixels,
                             int *width, int *height, double *scale);
 extern GBCustomFit gb_custom_fit;
