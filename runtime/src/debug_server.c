@@ -16,6 +16,7 @@
 #include "gbrt.h"
 #include "gb_platform_compat.h"
 #include "gb_body.h"
+#include "gb_rom_patch.h"
 #include "ppu.h"
 #include "platform_sdl.h"
 #include "gb_custom_view.h"
@@ -1285,6 +1286,25 @@ static void handle_run_to_frame(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"running_to\":%d}", id, target);
 }
 
+/* The player's ROM patch (gb_rom_patch.h): its name, and how many of its
+ * changed instructions have run and at how many positions. */
+static void handle_rom_patch_info(int id, const char *json)
+{
+    (void)json;
+    unsigned long long ran = 0;
+    size_t positions = 0;
+    gb_rom_patch_counts(&ran, &positions);
+    char name[300];
+    size_t n = 0;
+    for (const char *p = gb_rom_patch_active(); *p && n + 2 < sizeof(name); ++p) {
+        if (*p == '"' || *p == '\\') name[n++] = '\\';
+        name[n++] = *p;
+    }
+    name[n] = '\0';
+    send_fmt("{\"id\":%d,\"ok\":true,\"patch\":\"%s\",\"ran\":%llu,\"positions\":%llu}",
+             id, name, ran, (unsigned long long)positions);
+}
+
 /* Always-on interpreter-fallback ring: totals plus the top entry sites, kept
  * by gbrt_note_dispatch_fallback / gbrt_note_interpreter_session on every run
  * (Release included). Queried here rather than streamed, so a late-joining
@@ -1548,6 +1568,7 @@ static const CmdEntry s_commands[] = {
     { "ppu_state",         "LCDC/STAT/scroll/window/palette registers",                                  handle_ppu_state },
     { "hw_state",          "model, CGB mode, active body, MBC and CGB palette RAM",                      handle_hw_state },
     { "interp_fallbacks",  "always-on interpreter-fallback ring: totals and per-site counts",            handle_interp_fallbacks },
+    { "rom_patch_info",    "the ROM patch in use and how many of its changed instructions have run",     handle_rom_patch_info },
     { "mapper_state",      "current banks, MBC type, RAM enable and mode",                               handle_mapper_state },
     { "watch",             "watch a byte; changes arrive as watchpoint events (max 8)",                  handle_watch },
     { "unwatch",           "drop a watchpoint",                                                          handle_unwatch },

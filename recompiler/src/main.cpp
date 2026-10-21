@@ -24,8 +24,87 @@
 #include <set>
 #include <algorithm>
 #include <filesystem>
+#include <map>
+#include <toml.hpp>
 
 namespace fs = std::filesystem;
+
+extern "C" {
+#include "gb_sha256.h"
+#include "rom_patch.h"
+}
+
+/* [options] rom_patches: every IPS/BPS patch under `dir`, applied to the
+ * stock ROM, in path order. Each must apply and keep the ROM's size. The
+ * folder's patches.toml may name them for players: [[patch]] file = "...",
+ * title = "..."; otherwise a patch is called by its file name. */
+static bool load_rom_patches(const std::string& dir, const std::vector<uint8_t>& stock,
+                             std::vector<gbrecomp::codegen::GeneratorOptions::RomPatch>& out) {
+    if (!fs::is_directory(dir)) {
+        std::cout << "ROM patches: no folder at " << dir << ", none compiled\n";
+        return true;
+    }
+    std::map<std::string, std::string> titles;
+    const fs::path manifest = fs::path(dir) / "patches.toml";
+    if (fs::exists(manifest)) {
+        try {
+            toml::table table = toml::parse_file(manifest.string());
+            if (auto list = table["patch"].as_array()) {
+                for (auto& item : *list) {
+                    if (auto entry = item.as_table()) {
+                        auto file = (*entry)["file"].value<std::string>();
+                        auto title = (*entry)["title"].value<std::string>();
+                        if (file && title) titles[*file] = *title;
+                    }
+                }
+            }
+        } catch (const toml::parse_error& err) {
+            std::cerr << "Error: " << manifest.string() << ": " << err << "\n";
+            return false;
+        }
+    }
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        std::string ext = entry.path().extension().string();
+        for (char& c : ext) c = char(std::tolower((unsigned char)c));
+        if (ext == ".ips" || ext == ".ips32" || ext == ".bps") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end(), [&](const fs::path& a, const fs::path& b) {
+        return fs::relative(a, dir).generic_string() < fs::relative(b, dir).generic_string();
+    });
+    for (const auto& file : files) {
+        std::ifstream in(file, std::ios::binary);
+        std::vector<uint8_t> patch((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string name = fs::relative(file, dir).generic_string();
+        uint8_t* image = nullptr;
+        size_t image_size = 0;
+        char reason[192] = {0};
+        if (gb_patch_apply(patch.data(), patch.size(), stock.data(), stock.size(),
+                           &image, &image_size, reason, sizeof(reason)) != 0) {
+            std::cerr << "Error: ROM patch " << name << " does not apply: " << reason << "\n";
+            return false;
+        }
+        if (image_size != stock.size()) {
+            std::free(image);
+            std::cerr << "Error: ROM patch " << name << " changes the ROM's size ("
+                      << stock.size() << " -> " << image_size << " bytes)\n";
+            return false;
+        }
+        gbrecomp::codegen::GeneratorOptions::RomPatch rom_patch;
+        rom_patch.name = name;
+        auto title = titles.find(name);
+        rom_patch.title = title != titles.end() ? title->second : file.stem().string();
+        char digest[65];
+        gb_sha256_hex(patch.data(), patch.size(), digest);
+        rom_patch.patch_sha256 = digest;
+        rom_patch.image.assign(image, image + image_size);
+        std::free(image);
+        out.push_back(std::move(rom_patch));
+    }
+    std::cout << "ROM patches: " << out.size() << " in " << dir << "\n";
+    return true;
+}
 
 void print_banner() {
     std::cout << R"(
@@ -2112,6 +2191,14 @@ int main(int argc, char* argv[]) {
      *                             main() boots whichever body the game picks */
     gen_opts.exhaustive_rom = game_config.exhaustive_rom.value_or(false);
     gen_opts.resumable_instructions = game_config.resumable_instructions.value_or(false);
+    if (!game_config.rom_patches_dir.empty()) {
+        if (!gen_opts.exhaustive_rom) {
+            std::cerr << "Error: [options] rom_patches needs exhaustive_rom\n";
+            return 1;
+        }
+        if (!load_rom_patches(game_config.rom_patches_dir, rom.bytes(), gen_opts.rom_patches))
+            return 1;
+    }
     gen_opts.symbol_prefix = game_config.symbol_prefix;
     gen_opts.patch_file = game_config.patch_file;
     gen_opts.multi_body = game_config.multi_body.value_or(false);

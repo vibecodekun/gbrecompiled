@@ -1473,6 +1473,10 @@ static int g_pref_widescreen = 0;
 /* launcher.skip is the launcher's own ("Skip launcher on boot"); carried
  * through so a runtime save does not drop it. -1 = absent. */
 static int g_launcher_skip_pref = -1;
+/* The ROM patch the launcher chose (gb_rom_patch.h), carried through the
+ * same way. -1 = absent. */
+static int g_rom_patch_enabled_pref = -1;
+static std::string g_rom_patch_file_pref;
 
 static void load_runtime_preferences(void) {
     set_default_audio_preferences();
@@ -1499,6 +1503,8 @@ static void load_runtime_preferences(void) {
     g_menu_dim_percent = GB_MENU_DIM_DEFAULT;
     g_menu_opacity_percent = 100;
     g_launcher_skip_pref = -1;
+    g_rom_patch_enabled_pref = -1;
+    g_rom_patch_file_pref.clear();
     g_per_game_prefs.clear();
     g_slang_param_prefs.clear();
     g_slang_builder_origin.clear();
@@ -1649,6 +1655,14 @@ static void load_runtime_preferences(void) {
                 }
                 if (strcmp(key, "launcher.skip") == 0) {
                     g_launcher_skip_pref = (strcmp(value, "0") != 0) ? 1 : 0;
+                    continue;
+                }
+                if (strcmp(key, "rom.patch_enabled") == 0) {
+                    g_rom_patch_enabled_pref = (strcmp(value, "0") != 0) ? 1 : 0;
+                    continue;
+                }
+                if (strcmp(key, "rom.patch_file") == 0) {
+                    g_rom_patch_file_pref = value;
                     continue;
                 }
                 if (strcmp(key, "video.palette") == 0) {
@@ -1952,6 +1966,12 @@ static void save_runtime_preferences(void) {
     fprintf(file, "diag.show_overlay=%d\n", g_show_overlay ? 1 : 0);
     if (g_launcher_skip_pref >= 0) {
         fprintf(file, "launcher.skip=%d\n", g_launcher_skip_pref);
+    }
+    if (g_rom_patch_enabled_pref >= 0) {
+        fprintf(file, "rom.patch_enabled=%d\n", g_rom_patch_enabled_pref);
+    }
+    if (!g_rom_patch_file_pref.empty()) {
+        fprintf(file, "rom.patch_file=%s\n", g_rom_patch_file_pref.c_str());
     }
     if (!g_active_shader_pref.empty()) {
         fprintf(file, "shader.active=%s\n", g_active_shader_pref.c_str());

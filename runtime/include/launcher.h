@@ -49,6 +49,14 @@ void launcher_set_patch_file(const char *filename);
 const char *launcher_identity_sha256(void);
 
 /**
+ * Accept another exact ROM besides the expected one: the stock ROM with a
+ * patch the build was compiled for already applied (gb_rom_patch.h). Up to 32.
+ * launcher_accepted_sha256(i) lists them (NULL past the last).
+ */
+void launcher_add_accepted_sha256(const char *hex);
+const char *launcher_accepted_sha256(int index);
+
+/**
  * Apply a BPS patch to an in-memory ROM image. Nothing is written to disk and
  * the caller's buffer is left untouched.
  *

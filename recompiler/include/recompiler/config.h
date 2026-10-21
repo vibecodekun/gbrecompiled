@@ -106,6 +106,9 @@ struct GameConfig {
     std::vector<InlineCallConfig> inline_calls;
     std::optional<bool> scan_inline_calls;
     std::optional<bool> exhaustive_rom;
+    // [options] rom_patches: a folder of IPS/BPS patches for the stock ROM,
+    // relative to the config. Each one's changed instructions are compiled.
+    std::string rom_patches_dir;
     std::optional<bool> resumable_instructions;
     std::vector<uint8_t> scan_banks;       // [options] scan_banks = [...]
     std::optional<bool> pointer_scan;      // [options] pointer_scan

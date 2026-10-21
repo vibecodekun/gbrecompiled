@@ -104,6 +104,12 @@ std::optional<GameConfig> load_config(const std::string& path) {
         }
         if (auto v = opts->get("scan_inline_calls")) config.scan_inline_calls = v->value_or(false);
         if (auto v = opts->get("exhaustive_rom")) config.exhaustive_rom = v->value_or(false);
+        if (auto v = opts->get("rom_patches")) {
+            config.rom_patches_dir = v->value_or(std::string{});
+            if (!config.rom_patches_dir.empty() && fs::path(config.rom_patches_dir).is_relative()) {
+                config.rom_patches_dir = (config_dir / config.rom_patches_dir).string();
+            }
+        }
         if (auto v = opts->get("resumable_instructions")) config.resumable_instructions = v->value_or(false);
         if (auto v = opts->get("pointer_scan")) config.pointer_scan = v->value_or(true);
         if (auto arr = opts->get_as<toml::array>("scan_banks")) {

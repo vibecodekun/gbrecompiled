@@ -23,6 +23,8 @@ add_executable(gbrecomp
     # body's image with the exact same code that derives it from the user's ROM
     # at boot (one implementation, no drift).
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src/bps_patch.c
+    # ...and its IPS/BPS dispatcher, for the rom_patches folder's patches.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src/rom_patch.c
 )
 
 target_include_directories(gbrecomp

@@ -55,6 +55,8 @@ add_library(gbrt STATIC
     src/gb_sha1.c
     src/gb_sha256.c
     src/bps_patch.c
+    src/rom_patch.c
+    src/gb_rom_patch.c
 )
 
 # pthread for the BGB link recv thread

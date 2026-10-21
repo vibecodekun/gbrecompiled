@@ -30,8 +30,27 @@ static char s_asset_dir[512] = {0};      /* read-only payload shipped with the e
 static char s_expected_sha256[65] = {0};  /* gen-time ROM digest, "" = disabled */
 static char s_patch_file[260] = {0};      /* BPS filename (next to exe), "" = none */
 static char s_last_error[256] = {0};      /* reason for the most recent failure */
+static char s_accepted_sha256[32][65];    /* known patches' results */
+static int s_accepted_count = 0;
 
 const char *launcher_last_error(void) { return s_last_error; }
+
+void launcher_add_accepted_sha256(const char *hex) {
+    if (!hex || strlen(hex) != 64 || s_accepted_count >= 32) return;
+    for (int i = 0; i < s_accepted_count; i++)
+        if (strcmp(s_accepted_sha256[i], hex) == 0) return;
+    snprintf(s_accepted_sha256[s_accepted_count++], 65, "%s", hex);
+}
+
+const char *launcher_accepted_sha256(int index) {
+    return index >= 0 && index < s_accepted_count ? s_accepted_sha256[index] : NULL;
+}
+
+static int is_accepted_sha256(const char *hex) {
+    for (int i = 0; i < s_accepted_count; i++)
+        if (strcmp(s_accepted_sha256[i], hex) == 0) return 1;
+    return 0;
+}
 
 void launcher_set_expected_sha256(const char *hex) {
     if (hex && hex[0]) {
@@ -197,10 +216,12 @@ static int resolve_or_patch(const char *path, char *resolved, size_t resolved_sz
     unsigned char *rom = load_file(path, &sz);
     if (!rom) return 0;
 
-    if (buffer_sha_matches(rom, (size_t)sz, s_expected_sha256)) {
+    char digest[65];
+    gb_sha256_hex(rom, (size_t)sz, digest);
+    if (strcmp(digest, s_expected_sha256) == 0 || is_accepted_sha256(digest)) {
         free(rom);
         snprintf(resolved, resolved_sz, "%s", path);
-        return 1;  /* already the expected (e.g. extended) ROM */
+        return 1;  /* already the expected (e.g. extended) ROM, or a known patch's */
     }
     if (!s_patch_file[0]) { free(rom); return 0; }
 

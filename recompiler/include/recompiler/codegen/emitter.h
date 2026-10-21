@@ -116,6 +116,17 @@ struct GeneratorOptions {
     // instead of the interpreter. Larger switches; off by default.
     bool exhaustive_rom = false; // Ahead-of-time entry for every ROM byte, MBC5 <= 256 banks.
     bool resumable_instructions = false;
+
+    // [options] rom_patches: the patches a player may apply to the stock ROM
+    // whose changed instructions are compiled too (exhaustive_rom only; see
+    // runtime/include/gb_rom_patch.h).
+    struct RomPatch {
+        std::string name;            // path within the folder, '/'-separated
+        std::string title;           // what players are told it is (patches.toml)
+        std::string patch_sha256;
+        std::vector<uint8_t> image;  // the stock ROM with the patch applied
+    };
+    std::vector<RomPatch> rom_patches;
 };
 
 /**

@@ -8,6 +8,7 @@
 #include "game_extras.h"
 #include "gb_host_paths.h"
 #include "launcher.h"
+#include "gb_rom_patch.h"
 
 #include "recomp_launcher.h"   // recomp-ui C ABI
 #include "launcher_profile.h"  // launcher_profile_apply()
@@ -31,7 +32,7 @@ static void seam_join(char* out, size_t cap, const char* dir, const char* name) 
 static int seam_read_int(const char* path, const char* key, int def) {
     FILE* f = fopen(path, "r");
     if (!f) return def;
-    char line[256];
+    char line[1200];
     size_t kl = strlen(key);
     int val = def;
     while (fgets(line, sizeof(line), f)) {
@@ -45,6 +46,34 @@ static int seam_read_int(const char* path, const char* key, int def) {
     }
     fclose(f);
     return val;
+}
+
+/* Read a flat "key=value" string; "" if absent. */
+static void seam_read_str(const char* path, const char* key, char* out, size_t cap) {
+    out[0] = '\0';
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char line[1200];
+    size_t kl = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        char* s = line;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (strncmp(s, key, kl) != 0) continue;
+        const char* p = s + kl;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p != '=') continue;
+        snprintf(out, cap, "%.*s", (int)strcspn(p + 1, "\r\n"), p + 1);
+    }
+    fclose(f);
+}
+
+/* The launcher's ROM PATCH panel: what the chosen patch does on this build. */
+static int seam_rom_patch_check(const uint8_t* source, size_t source_len,
+                                const uint8_t* patched, size_t patched_len,
+                                char* message, size_t message_cap) {
+    GBPatchReport report;
+    gb_rom_patch_assess(source, source_len, patched, patched_len, &report);
+    return gb_rom_patch_describe(&report, message, message_cap);
 }
 
 /* Does `line` (leading ws) assign flat key `key`? */
@@ -88,7 +117,7 @@ static void seam_upsert(const char* path, const char* key, const char* value) {
         }
     }
 
-    char assign[256];
+    char assign[1200];
     snprintf(assign, sizeof(assign), "%s=%s", key, value);
     int hit = -1;
     for (int i = 0; i < n; ++i) if (seam_line_is_key(lines[i], key)) { hit = i; break; }
@@ -176,6 +205,9 @@ int gb_launcher_preboot(void) {
     ls.widescreen    = seam_read_int(prefs_path, "video.widescreen", 0);
     ls.player_src[0] = 1;   /* keyboard */
     ls.skip_launcher = 0;
+    /* The player's ROM patch (gb_rom_patch.h), which the runtime applies. */
+    ls.rom_patch_enabled = seam_read_int(prefs_path, "rom.patch_enabled", 0);
+    seam_read_str(prefs_path, "rom.patch_file", ls.rom_patch_path, sizeof(ls.rom_patch_path));
 
     /* ── game identity + capabilities ── */
     RecompLauncherCGameInfo gi;
@@ -197,9 +229,11 @@ int gb_launcher_preboot(void) {
      * Play only when it matches; launcher_get_rom_path() checks again at boot.
      * Prefer the multi-revision CRC list, else the single expected CRC, else
      * the SHA-256 the recompiler embedded (main() registers it before this
-     * runs). Never more than one: the launcher demands every fingerprint it is
-     * given. With none it can vouch for nothing and lets every ROM through. */
-    static uint8_t s_known_sha256[1][32];
+     * runs). Never more than one kind: the launcher demands every kind of
+     * fingerprint it is given (any one digest of a kind will do). With none it
+     * can vouch for nothing and lets every ROM through. The SHA-256s also
+     * take the stock ROM with a patch the build was compiled for applied. */
+    static uint8_t s_known_sha256[33][32];
     int crc_count = 0;
     const uint32_t* crcs = game_get_valid_crcs(&crc_count);
     if (crc_count > 0 && crcs) {
@@ -211,9 +245,20 @@ int gb_launcher_preboot(void) {
     } else {
         const char* sha = launcher_identity_sha256();
         if (sha && seam_sha256_bytes(sha, s_known_sha256[0])) {
+            size_t count = 1;
+            for (int i = 0; count < 33 && launcher_accepted_sha256(i); ++i)
+                if (seam_sha256_bytes(launcher_accepted_sha256(i), s_known_sha256[count])) ++count;
             gi.known_sha256 = (const uint8_t (*)[32])s_known_sha256;
-            gi.num_known_sha256 = 1;
+            gi.num_known_sha256 = count;
         }
+    }
+
+    /* ROM patches: checked here, applied by the runtime at boot (gb_rom_patch.h). */
+    if (gb_rom_patch_tables()) {
+        gi.rom_patch_supported = 1;
+        gi.rom_patch_check = seam_rom_patch_check;
+        gi.rom_patch_note = "An IPS or BPS patch (a translation, a fix, a hack) is applied to "
+                            "the ROM as the game starts; the ROM file is left as it is.";
     }
 
     /* Opt-in widescreen: expose the "Widescreen 16:9" toggle (drawn with an
@@ -298,6 +343,10 @@ int gb_launcher_preboot(void) {
     seam_upsert_int(prefs_path, "audio.volume_percent", ls.volume);
     seam_upsert_int(prefs_path, "video.widescreen",     ls.widescreen ? 1 : 0);
     seam_upsert_int(prefs_path, "launcher.skip",        ls.skip_launcher ? 1 : 0);
+    if (gi.rom_patch_supported) {
+        seam_upsert_int(prefs_path, "rom.patch_enabled", ls.rom_patch_enabled && ls.rom_patch_path[0] ? 1 : 0);
+        seam_upsert(prefs_path, "rom.patch_file", ls.rom_patch_path);
+    }
 
     if (out_rom[0]) seam_write_rom_cfg(romcfg_path, out_rom);
 
