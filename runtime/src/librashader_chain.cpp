@@ -145,10 +145,16 @@ typedef void (GL_APIENTRY* PFN_gbBindSampler)(GLuint unit, GLuint sampler);
 PFN_gbBindSampler g_bind_sampler = NULL;
 GLint g_sampler_units = 0;
 
-/* The output of the layer's chain (gb_lrs_render_layer). */
-GLuint g_layer_out_tex = 0;
-int g_layer_out_w = 0;
-int g_layer_out_h = 0;
+/* The pictures drawn over the game's with a chain of their own: a game's
+ * layer (gb_lrs_render_layer) and each of its HUD's pictures
+ * (gb_lrs_render_hud), which may be drawn in the same frame. */
+enum { LAYER_BOTTOM, LAYER_HUD, LAYER_COUNT = LAYER_HUD + GB_LRS_HUD_CHAINS };
+const char* const g_layer_names[LAYER_COUNT] = {"layer", "hud 0", "hud 1", "hud 2", "hud 3"};
+
+/* The output of each one's chain. */
+GLuint g_layer_out_tex[LAYER_COUNT] = {};
+int g_layer_out_w[LAYER_COUNT] = {};
+int g_layer_out_h[LAYER_COUNT] = {};
 
 #ifdef GB_LRS_SUPPORTED
 libra_instance_t g_lr;
@@ -158,14 +164,14 @@ Uint64 g_last_counter = 0;
 unsigned g_frame_failures = 0;
 unsigned g_gl_error_frames = 0;
 
-/* The running preset again for a layer over the game's picture, made the
- * first time one is drawn: presets that keep past frames keep each picture's
- * own. Failed when that did not work, until the next preset. */
-libra_gl_filter_chain_t g_layer_chain = NULL;
-bool g_layer_failed = false;
-size_t g_layer_frame = 0;
-Uint64 g_layer_last_counter = 0;
-bool g_layer_clear_history = false;
+/* The running preset again for each picture over the game's, made the first
+ * time one is drawn: presets that keep past frames keep each picture's own.
+ * Failed when that did not work, until the next preset. */
+libra_gl_filter_chain_t g_layer_chain[LAYER_COUNT] = {};
+bool g_layer_failed[LAYER_COUNT] = {};
+size_t g_layer_frame[LAYER_COUNT] = {};
+Uint64 g_layer_last_counter[LAYER_COUNT] = {};
+bool g_layer_clear_history[LAYER_COUNT] = {};
 
 /* librashader calls the loader as extern "system", which is __stdcall on
  * 32-bit x86; its header's libra_gl_loader_t names no convention (cdecl). */
@@ -201,11 +207,13 @@ std::string take_error(libra_error_t e, const char* what) {
 void chain_free(void) {
     if (g_chain) drop(g_lr.gl_filter_chain_free(&g_chain));
     g_chain = NULL;
-    if (g_layer_chain) drop(g_lr.gl_filter_chain_free(&g_layer_chain));
-    g_layer_chain = NULL;
-    g_layer_failed = false;
-    g_layer_frame = 0;
-    g_layer_last_counter = 0;
+    for (int i = 0; i < LAYER_COUNT; i++) {
+        if (g_layer_chain[i]) drop(g_lr.gl_filter_chain_free(&g_layer_chain[i]));
+        g_layer_chain[i] = NULL;
+        g_layer_failed[i] = false;
+        g_layer_frame[i] = 0;
+        g_layer_last_counter[i] = 0;
+    }
 }
 #endif
 
@@ -631,52 +639,62 @@ unsigned gb_lrs_render(unsigned src_tex, int src_w, int src_h, int out_w, int ou
 #endif
 }
 
-unsigned gb_lrs_render_layer(unsigned src_tex, int src_w, int src_h, int out_w, int out_h) {
+/* Picture i over the game's through its own chain (gb_lrs_render_layer). */
+static unsigned render_layer(int i, unsigned src_tex, int src_w, int src_h, int out_w, int out_h) {
 #ifdef GB_LRS_SUPPORTED
-    if (!g_chain || g_layer_failed || !src_tex || src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0) return 0;
-    if (!g_layer_chain) {
+    if (!g_chain || g_layer_failed[i] || !src_tex || src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0) return 0;
+    if (!g_layer_chain[i]) {
         const Uint64 started = SDL_GetPerformanceCounter();
         std::string error;
-        if (!create_chain(g_path.c_str(), g_chain_unoptimized, &g_layer_chain, NULL, &error)) {
-            g_layer_chain = NULL;
-            g_layer_failed = true;
-            fprintf(stderr, "[SHADER] layer: %s\n", error.c_str());
+        if (!create_chain(g_path.c_str(), g_chain_unoptimized, &g_layer_chain[i], NULL, &error)) {
+            g_layer_chain[i] = NULL;
+            g_layer_failed[i] = true;
+            fprintf(stderr, "[SHADER] %s: %s\n", g_layer_names[i], error.c_str());
             return 0;
         }
         for (const Param& p : g_params)
-            drop(g_lr.gl_filter_chain_set_param(&g_layer_chain, p.name.c_str(), p.pub.value));
-        g_layer_frame = 0;
-        g_layer_last_counter = 0;
-        g_layer_clear_history = false;
-        fprintf(stderr, "[SHADER] layer chain for %s in %.0f ms\n", g_path.c_str(),
+            drop(g_lr.gl_filter_chain_set_param(&g_layer_chain[i], p.name.c_str(), p.pub.value));
+        g_layer_frame[i] = 0;
+        g_layer_last_counter[i] = 0;
+        g_layer_clear_history[i] = false;
+        fprintf(stderr, "[SHADER] %s chain for %s in %.0f ms\n", g_layer_names[i], g_path.c_str(),
                 (double)(SDL_GetPerformanceCounter() - started) * 1000.0 / (double)SDL_GetPerformanceFrequency());
     }
-    if (!ensure_texture(g_layer_out_tex, g_layer_out_w, g_layer_out_h, out_w, out_h)) return 0;
+    if (!ensure_texture(g_layer_out_tex[i], g_layer_out_w[i], g_layer_out_h[i], out_w, out_h)) return 0;
     libra_image_gl_t in = { src_tex, GL_RGBA8, (uint32_t)src_w, (uint32_t)src_h };
-    libra_image_gl_t out = { g_layer_out_tex, GL_RGBA8, (uint32_t)out_w, (uint32_t)out_h };
-    const frame_gl_opt_t opt = frame_options(src_tex, g_layer_clear_history, g_layer_last_counter);
+    libra_image_gl_t out = { g_layer_out_tex[i], GL_RGBA8, (uint32_t)out_w, (uint32_t)out_h };
+    const frame_gl_opt_t opt = frame_options(src_tex, g_layer_clear_history[i], g_layer_last_counter[i]);
     while (glGetError() != GL_NO_ERROR) {}
-    libra_error_t e = g_lr.gl_filter_chain_frame(&g_layer_chain, g_layer_frame, in, out, NULL, NULL, &opt);
+    libra_error_t e = g_lr.gl_filter_chain_frame(&g_layer_chain[i], g_layer_frame[i], in, out, NULL, NULL, &opt);
     restore_gl_state();
     if (e) {
-        /* The runtime draws the layer with its built-in shader from then on. */
-        fprintf(stderr, "[SHADER] layer: %s\n", take_error(e, "frame").c_str());
-        g_layer_failed = true;
+        /* The runtime draws it with its built-in shader from then on. */
+        fprintf(stderr, "[SHADER] %s: %s\n", g_layer_names[i], take_error(e, "frame").c_str());
+        g_layer_failed[i] = true;
         return 0;
     }
-    g_layer_frame++;
-    g_layer_clear_history = false;
-    return g_layer_out_tex;
+    g_layer_frame[i]++;
+    g_layer_clear_history[i] = false;
+    return g_layer_out_tex[i];
 #else
-    (void)src_tex; (void)src_w; (void)src_h; (void)out_w; (void)out_h;
+    (void)i; (void)src_tex; (void)src_w; (void)src_h; (void)out_w; (void)out_h;
     return 0;
 #endif
+}
+
+unsigned gb_lrs_render_layer(unsigned src_tex, int src_w, int src_h, int out_w, int out_h) {
+    return render_layer(LAYER_BOTTOM, src_tex, src_w, src_h, out_w, out_h);
+}
+
+unsigned gb_lrs_render_hud(int chain, unsigned src_tex, int src_w, int src_h, int out_w, int out_h) {
+    if (chain < 0 || chain >= GB_LRS_HUD_CHAINS) return 0;
+    return render_layer(LAYER_HUD + chain, src_tex, src_w, src_h, out_w, out_h);
 }
 
 void gb_lrs_clear_history(void) {
     g_clear_history = true;
 #ifdef GB_LRS_SUPPORTED
-    g_layer_clear_history = true;
+    for (int i = 0; i < LAYER_COUNT; i++) g_layer_clear_history[i] = true;
 #endif
 }
 
@@ -705,8 +723,9 @@ bool gb_lrs_set_param(int index, float value) {
         drop(e);
         return false;
     }
-    if (g_layer_chain)
-        drop(g_lr.gl_filter_chain_set_param(&g_layer_chain, g_params[(size_t)index].name.c_str(), value));
+    for (int i = 0; i < LAYER_COUNT; i++)
+        if (g_layer_chain[i])
+            drop(g_lr.gl_filter_chain_set_param(&g_layer_chain[i], g_params[(size_t)index].name.c_str(), value));
     p.value = value;
     return true;
 #else
@@ -1037,11 +1056,13 @@ void gb_lrs_shutdown(void) {
         g_out_tex = 0;
     }
     g_out_w = g_out_h = 0;
-    if (g_layer_out_tex) {
-        glDeleteTextures(1, &g_layer_out_tex);
-        g_layer_out_tex = 0;
+    for (int i = 0; i < LAYER_COUNT; i++) {
+        if (g_layer_out_tex[i]) {
+            glDeleteTextures(1, &g_layer_out_tex[i]);
+            g_layer_out_tex[i] = 0;
+        }
+        g_layer_out_w[i] = g_layer_out_h[i] = 0;
     }
-    g_layer_out_w = g_layer_out_h = 0;
 }
 
 }  /* extern "C" */

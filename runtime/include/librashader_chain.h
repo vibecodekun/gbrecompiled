@@ -65,6 +65,12 @@ unsigned gb_lrs_render(unsigned src_tex, int src_w, int src_h, int out_w, int ou
  * when there is no preset or the chain could not be made or run (the caller
  * draws unshaded). */
 unsigned gb_lrs_render_layer(unsigned src_tex, int src_w, int src_h, int out_w, int out_h);
+/* The same for a picture of a game's HUD (game_draw_hud), through chain
+ * 0 to GB_LRS_HUD_CHAINS - 1 of its own: pictures drawn in the same frame
+ * need chains of their own, as each chain's output is kept until the frame
+ * is drawn. Its output is opaque: presets write alpha 1. */
+#define GB_LRS_HUD_CHAINS 4
+unsigned gb_lrs_render_hud(int chain, unsigned src_tex, int src_w, int src_h, int out_w, int out_h);
 
 /* Drop history and feedback frames on the next render (after a state load,
  * so a CRT preset's persistence does not bleed the old scene through), the

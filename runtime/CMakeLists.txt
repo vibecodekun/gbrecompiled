@@ -20,6 +20,9 @@ add_library(gbrt STATIC
     src/game_defaults/game_default_on_frame.c
     src/game_defaults/game_default_post_frame.c
     src/game_defaults/game_default_draw_overlay.c
+    src/game_defaults/game_default_draw_hud.c
+    src/game_defaults/game_default_draw_hud_into_picture.c
+    src/game_defaults/game_default_actions.c
     src/game_defaults/game_default_get_mods.c
     src/game_defaults/game_default_fill_frame_record.c
     src/game_defaults/game_default_handle_debug_cmd.c

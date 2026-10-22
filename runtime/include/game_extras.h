@@ -43,6 +43,89 @@ void game_post_frame(struct GBContext *ctx);
  * Keeps the agnostic core free of any game-specific UI. */
 void game_draw_overlay(struct GBContext *ctx);
 
+/* ---- Game actions: buttons of the game's own ----
+ *
+ * Actions beyond the Game Boy's eight buttons (a transformation, a map), bound
+ * to keys and controller buttons like the runtime's own: listed in the
+ * settings window's Controls, saved in runtime_prefs.ini as
+ * keyboard.game_<id>.<slot> / controller.game_<id>.<slot>, and held only while
+ * no menu is open. A default that another action already has (a binding the
+ * player made, or a runtime default it replaces) is left unbound. Default: no
+ * actions. */
+#define GB_GAME_ACTION_MAX 16
+typedef struct GBGameAction {
+    const char *id;       /* config name: letters, digits and '_' */
+    const char *label;    /* as Controls lists it */
+    int keys[2];          /* default SDL_Scancodes; 0 none */
+    int button;           /* default SDL_GameControllerButton; -1 none */
+} GBGameAction;
+const GBGameAction *game_get_actions(int *count);
+/* Whether action i of game_get_actions() is held. */
+int gb_platform_game_action_held(int i);
+/* A binding as the runtime keeps it: kind 0 none, 1 a key (code an
+ * SDL_Scancode), 2 a controller button (SDL_GameControllerButton), 3 / 4 a
+ * controller axis pushed positive / negative (SDL_GameControllerAxis). */
+typedef struct GBActionBinding { int kind, code; } GBActionBinding;
+/* Action i's two keyboard and two controller bindings. */
+void gb_platform_game_action_bindings(int i, GBActionBinding keyboard[2], GBActionBinding controller[2]);
+/* The same for a Game Boy button: 0 Right, 1 Left, 2 Up, 3 Down, 4 A, 5 B,
+ * 6 Select, 7 Start. */
+void gb_platform_joypad_bindings(int button, GBActionBinding keyboard[2], GBActionBinding controller[2]);
+/* How the runtime names a binding ("Z", "West Face", "Left Shoulder"...),
+ * written to out. */
+void gb_platform_binding_label(GBActionBinding binding, char *out, int size);
+/* The connected controller's face-button family: -1 none, 0 unknown, 1 Xbox,
+ * 2 PlayStation, 3 Nintendo. And which device was used last: 0 the keyboard,
+ * 1 a controller. */
+int gb_platform_controller_family(void);
+int gb_platform_last_input_device(void);
+/* The Game Boy buttons held, as the debug server's input mask: bit 0 Right,
+ * 1 Left, 2 Up, 3 Down, 4 A, 5 B, 6 Select, 7 Start; whatever is pressed,
+ * menus open or not (for a game screen that reads them while the game is held). */
+int gb_platform_joypad_held(void);
+
+/* ---- HUD and game screens ----
+ *
+ * The presented picture, in window coordinates (ImGui's), for a HUD drawn
+ * beside or over it. */
+typedef struct GBHudFrame {
+    float window_w, window_h;
+    float x, y, w, h;      /* the game picture */
+    float scale;           /* window pixels per game pixel across */
+    int menu_open;         /* a runtime menu is up (it draws over the HUD) */
+    int picture_w, picture_h;   /* the picture's own pixels */
+    int native;            /* it is the Game Boy's own 160 x 144 (no game view, or a frame it declined) */
+    /* The window can draw a HUD over the picture apart from it. 0 with a
+     * shader preset that draws over the whole window (a bezel): the picture
+     * is somewhere inside what the preset draws, so the game draws its HUD
+     * into the picture instead (game_draw_hud_into_picture). */
+    int layers;
+} GBHudFrame;
+/* Called every presented frame inside the runtime's ImGui frame, before its
+ * menus; ImGui's background draw list is drawn over the picture and under the
+ * menus. Not called without a window. Default: nothing. */
+void game_draw_hud(struct GBContext *ctx, const GBHudFrame *frame);
+/* A game screen (a map) is open: the game is held, as by Pause in Menu, and
+ * frames keep being presented (with game_draw_hud) until it closes. */
+void gb_platform_set_game_screen(int open);
+/* A texture for the HUD: argb (0xAARRGGBB, width x height) uploaded to slot
+ * 0-31, nearest filtered. Returns it as an ImTextureID, 0 without a window. */
+uintptr_t gb_platform_hud_texture(int slot, const uint32_t *argb, int width, int height);
+/* Slot's texture through the running shader preset, as the window draws a
+ * game's layer: a chain of its own at the size it is drawn (width x height in
+ * window coordinates), so a preset that works per pixel (an LCD grid,
+ * scanlines) works per HUD pixel. Its transparency is the texture's own.
+ * Returns it as an ImTextureID, or 0 with no preset running (or one that
+ * failed): draw the plain texture then. Slots 0-3 each have a chain of their
+ * own, so they can be drawn in the same frame; slots past 3 share the
+ * fourth's, whose output the last call of a frame leaves. */
+uintptr_t gb_platform_hud_shaded(int slot, float width, float height);
+/* Each presented frame while frame.layers would be 0 (a preset that draws
+ * over the whole window), before the preset runs: the game may draw its HUD
+ * into the picture, `pixels` (width x height, 0xAARRGGBB; `native` as in
+ * GBHudFrame). Not called without a window. Default: nothing. */
+void game_draw_hud_into_picture(struct GBContext *ctx, uint32_t *pixels, int width, int height, int native);
+
 /* Built-in Mods for the shared preboot launcher. The game owns the provider
  * and persists its selection beside the executable. Default: no Mods. */
 struct RecompLauncherCModProvider;

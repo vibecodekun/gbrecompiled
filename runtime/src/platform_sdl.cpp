@@ -413,7 +413,9 @@ typedef enum GBInputAction {
     GB_INPUT_ACTION_TOGGLE_MENU = 17,
     GB_INPUT_ACTION_PAUSE = 18,
     GB_INPUT_ACTION_FRAME_ADVANCE = 19,
-    GB_INPUT_ACTION_COUNT = 20,
+    /* The game's own (game_get_actions), as many as it declares. */
+    GB_INPUT_ACTION_GAME_FIRST = 20,
+    GB_INPUT_ACTION_COUNT = GB_INPUT_ACTION_GAME_FIRST + GB_GAME_ACTION_MAX,
 } GBInputAction;
 typedef enum GBInputBindingKind {
     GB_INPUT_BINDING_NONE = 0,
@@ -564,7 +566,20 @@ static const char* g_input_action_names[GB_INPUT_ACTION_COUNT] = {
     "Toggle Menu",
     "Pause",
     "Frame Advance",
+    /* The game's actions: their labels, from game_get_actions(). */
 };
+/* The game's actions: how many it declares, their config names
+ * ("game_<id>"), and whether runtime_prefs.ini had a line for each. */
+static int g_game_action_count = 0;
+static char g_game_action_config[GB_GAME_ACTION_MAX][48];
+static bool g_game_action_loaded[GB_GAME_ACTION_MAX][2];   /* keyboard, controller */
+static int g_last_input_device = 0;   /* 0 keyboard, 1 controller */
+/* A game screen (gb_platform_set_game_screen) holds the game while open. */
+static bool g_game_screen_open = false;
+/* The game stands still: a menu holds it (Pause in Menu) or a game screen is open. */
+static bool game_held(void) {
+    return menu_holds_game() || g_game_screen_open;
+}
 
 static bool has_interpreter_activity(const GBContext* ctx) {
     return ctx != NULL &&
@@ -1298,6 +1313,28 @@ static GBInputBinding make_binding(GBInputBindingKind kind, int code) {
     return binding;
 }
 
+static bool binding_equals(const GBInputBinding& a, const GBInputBinding& b) {
+    return a.kind != GB_INPUT_BINDING_NONE && a.kind == b.kind && a.code == b.code;
+}
+
+/* The game's actions (game_get_actions): their labels in Controls and their
+ * config names. Read once. */
+static void load_game_actions(void) {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    int count = 0;
+    const GBGameAction* actions = game_get_actions(&count);
+    if (!actions || count < 0) count = 0;
+    g_game_action_count = std::min(count, GB_GAME_ACTION_MAX);
+    for (int i = 0; i < g_game_action_count; i++) {
+        g_input_action_names[GB_INPUT_ACTION_GAME_FIRST + i] =
+            actions[i].label ? actions[i].label : actions[i].id;
+        snprintf(g_game_action_config[i], sizeof(g_game_action_config[i]), "game_%s",
+                 actions[i].id ? actions[i].id : "");
+    }
+}
+
 static const char* input_action_config_name(GBInputAction action) {
     switch (action) {
         case GB_INPUT_ACTION_RIGHT: return "right";
@@ -1322,6 +1359,10 @@ static const char* input_action_config_name(GBInputAction action) {
         case GB_INPUT_ACTION_FRAME_ADVANCE: return "frame_advance";
         case GB_INPUT_ACTION_COUNT:
         default:
+            if (action >= GB_INPUT_ACTION_GAME_FIRST &&
+                action < GB_INPUT_ACTION_GAME_FIRST + g_game_action_count) {
+                return g_game_action_config[action - GB_INPUT_ACTION_GAME_FIRST];
+            }
             return "unknown";
     }
 }
@@ -1331,7 +1372,7 @@ static bool parse_input_action_name(const char* text, GBInputAction* out_action)
         return false;
     }
 
-    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+    for (int action = 0; action < GB_INPUT_ACTION_GAME_FIRST + g_game_action_count; action++) {
         if (strcmp(text, input_action_config_name((GBInputAction)action)) == 0) {
             *out_action = (GBInputAction)action;
             return true;
@@ -1449,7 +1490,56 @@ static void set_default_input_bindings(void) {
     g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_LEFTSTICK);
     g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 
+    /* The game's actions. A controller button one of them takes is the
+     * game's: the runtime's default for it goes. */
+    load_game_actions();
+    int count = 0;
+    const GBGameAction* actions = game_get_actions(&count);
+    for (int i = 0; i < g_game_action_count; i++) {
+        const int action = GB_INPUT_ACTION_GAME_FIRST + i;
+        for (int slot = 0; slot < 2; slot++) {
+            if (actions[i].keys[slot] > 0) {
+                g_keyboard_bindings[action][slot] = make_binding(GB_INPUT_BINDING_KEY, actions[i].keys[slot]);
+            }
+        }
+        if (actions[i].button >= 0 && actions[i].button < SDL_CONTROLLER_BUTTON_MAX) {
+            const GBInputBinding button = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, actions[i].button);
+            for (int other = 0; other < GB_INPUT_ACTION_GAME_FIRST; other++) {
+                for (int slot = 0; slot < 2; slot++) {
+                    if (binding_equals(g_controller_bindings[other][slot], button)) {
+                        g_controller_bindings[other][slot] = make_binding(GB_INPUT_BINDING_NONE, 0);
+                    }
+                }
+            }
+            g_controller_bindings[action][0] = button;
+        }
+    }
+
     clear_all_binding_pressed_state();
+}
+
+/* After runtime_prefs.ini is read: a game action's default that the file
+ * did not set and that another action has there (the player's binding, or a
+ * runtime default saved before the game had actions) is left unbound. */
+static void unbind_taken_game_defaults(void) {
+    for (int i = 0; i < g_game_action_count; i++) {
+        const int action = GB_INPUT_ACTION_GAME_FIRST + i;
+        for (int device = 0; device < 2; device++) {
+            if (g_game_action_loaded[i][device]) continue;
+            GBInputBinding (*bindings)[2] = device ? g_controller_bindings : g_keyboard_bindings;
+            for (int slot = 0; slot < 2; slot++) {
+                if (bindings[action][slot].kind == GB_INPUT_BINDING_NONE) continue;
+                for (int other = 0; other < GB_INPUT_ACTION_GAME_FIRST + g_game_action_count; other++) {
+                    if (other == action) continue;
+                    if (binding_equals(bindings[other][0], bindings[action][slot]) ||
+                        binding_equals(bindings[other][1], bindings[action][slot])) {
+                        bindings[action][slot] = make_binding(GB_INPUT_BINDING_NONE, 0);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 static std::string runtime_preferences_path(void) {
@@ -1876,10 +1966,14 @@ static void load_runtime_preferences(void) {
                 } else {
                     g_controller_bindings[action][slot] = binding;
                 }
+                if (action >= GB_INPUT_ACTION_GAME_FIRST) {
+                    g_game_action_loaded[action - GB_INPUT_ACTION_GAME_FIRST][is_keyboard ? 0 : 1] = true;
+                }
             }
             fclose(file);
         }
     }
+    unbind_taken_game_defaults();
     update_effective_joypad_state();
 }
 
@@ -2006,7 +2100,7 @@ static void save_runtime_preferences(void) {
         }
     }
 
-    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+    for (int action = 0; action < GB_INPUT_ACTION_GAME_FIRST + g_game_action_count; action++) {
         for (int slot = 0; slot < 2; slot++) {
             char value[64];
             binding_to_config_value(g_keyboard_bindings[action][slot], value, sizeof(value));
@@ -2014,7 +2108,7 @@ static void save_runtime_preferences(void) {
         }
     }
 
-    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+    for (int action = 0; action < GB_INPUT_ACTION_GAME_FIRST + g_game_action_count; action++) {
         for (int slot = 0; slot < 2; slot++) {
             char value[64];
             binding_to_config_value(g_controller_bindings[action][slot], value, sizeof(value));
@@ -4750,6 +4844,13 @@ static void convert_for_upload(const uint32_t* framebuffer, int width, int heigh
     }
 }
 
+/* Whether the window draws a game's HUD over the picture apart from it: not
+ * with a preset that draws over the whole window (a bezel), where the picture
+ * is somewhere inside what it draws (GBHudFrame.layers). */
+static bool hud_layers(void) {
+    return !(gb_lrs_active() && g_slang_fill_window);
+}
+
 static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_frame) {
     if (!framebuffer) {
         DBG_FRAME("Platform render_frame: SKIPPED (null: tex=%d, gl=%d, fb=%d)",
@@ -4913,6 +5014,15 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
      * pass since we're touching every pixel anyway. */
     double upload_start_ms = sdl_now_ms();
     static std::vector<uint32_t> s_upload_buf;
+    /* A preset that draws over the whole window leaves the game's HUD no
+     * place apart from the picture: the game may draw it into a copy. */
+    if (!hud_layers() && g_registered_ctx) {
+        static std::vector<uint32_t> s_hud_picture;
+        s_hud_picture.assign(framebuffer, framebuffer + (size_t)presentation_width() * presentation_height());
+        game_draw_hud_into_picture(g_registered_ctx, s_hud_picture.data(), presentation_width(),
+                                   presentation_height(), !gb_custom_render || g_native_presented ? 1 : 0);
+        framebuffer = s_hud_picture.data();
+    }
     convert_for_upload(framebuffer, presentation_width(), presentation_height(), s_upload_buf);
     glBindTexture(GL_TEXTURE_2D, g_game_tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
@@ -5053,6 +5163,35 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
     ImGui::NewFrame();
     ImGuiIO& imgui_io = ImGui::GetIO();
     imgui_io.FontGlobalScale = settings_ui_scale_for_size(imgui_io.DisplaySize);
+
+    /* The game's HUD, under the menus: the picture's rect in window
+     * coordinates, inside a border when one is drawn. */
+    if (g_registered_ctx) {
+        GBHudFrame hud = {};
+        hud.window_w = imgui_io.DisplaySize.x;
+        hud.window_h = imgui_io.DisplaySize.y;
+        hud.x = (float)g_game_viewport.x;
+        hud.y = (float)g_game_viewport.y;
+        hud.w = (float)g_game_viewport.w;
+        hud.h = (float)g_game_viewport.h;
+        float content_w = (float)presentation_width();
+        if (active_border) {
+            const float sx = (float)g_game_viewport.w / (float)GB_BORDER_FULL_W;
+            const float sy = (float)g_game_viewport.h / (float)GB_BORDER_FULL_H;
+            hud.x += GB_BORDER_INSET_X * sx;
+            hud.y += GB_BORDER_INSET_Y * sy;
+            hud.w = GB_SCREEN_WIDTH * sx;
+            hud.h = GB_SCREEN_HEIGHT * sy;
+            content_w = GB_SCREEN_WIDTH;
+        }
+        hud.scale = content_w > 0.0f ? hud.w / content_w : 1.0f;
+        hud.menu_open = menu_open() ? 1 : 0;
+        hud.picture_w = active_border ? GB_SCREEN_WIDTH : presentation_width();
+        hud.picture_h = active_border ? GB_SCREEN_HEIGHT : presentation_height();
+        hud.native = !gb_custom_render || g_native_presented ? 1 : 0;
+        hud.layers = hud_layers() ? 1 : 0;
+        game_draw_hud(g_registered_ctx, &hud);
+    }
 
     g_menu_text_input = false;
     g_menu_popup_open = false;
@@ -6259,17 +6398,35 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                                   GB_INPUT_ACTION_RIGHT,
                                   GB_INPUT_ACTION_FAST_FORWARD);
             ImGui::Spacing();
+            if (g_game_action_count > 0) {
+                const GBInputAction game_end = (GBInputAction)(GB_INPUT_ACTION_GAME_FIRST + g_game_action_count);
+                const std::string keyboard_label = std::string("Keyboard ") + game_get_name();
+                const std::string controller_label = std::string("Controller ") + game_get_name();
+                ImGui::Spacing();
+                render_binding_editor(keyboard_label.c_str(),
+                                      GB_CAPTURE_DEVICE_KEYBOARD,
+                                      g_keyboard_bindings,
+                                      GB_INPUT_ACTION_GAME_FIRST,
+                                      game_end);
+                ImGui::Spacing();
+                render_binding_editor(controller_label.c_str(),
+                                      GB_CAPTURE_DEVICE_CONTROLLER,
+                                      g_controller_bindings,
+                                      GB_INPUT_ACTION_GAME_FIRST,
+                                      game_end);
+            }
+            ImGui::Spacing();
             render_binding_editor("Keyboard Shortcuts",
                                   GB_CAPTURE_DEVICE_KEYBOARD,
                                   g_keyboard_bindings,
                                   GB_INPUT_ACTION_FAST_FORWARD,
-                                  GB_INPUT_ACTION_COUNT);
+                                  GB_INPUT_ACTION_GAME_FIRST);
             ImGui::Spacing();
             render_binding_editor("Controller Shortcuts",
                                   GB_CAPTURE_DEVICE_CONTROLLER,
                                   g_controller_bindings,
                                   GB_INPUT_ACTION_FAST_FORWARD,
-                                  GB_INPUT_ACTION_COUNT);
+                                  GB_INPUT_ACTION_GAME_FIRST);
             if (g_binding_capture_active) {
                 ImGui::Separator();
                 ImGui::TextDisabled("Waiting for %s input for %s slot %d",
@@ -6758,7 +6915,7 @@ static bool audio_output_should_run(void) {
            !g_benchmark_mode &&
            !g_app_suspended &&
            !g_user_paused &&
-           !menu_holds_game() &&
+           !game_held() &&
            (effective_speed_percent() == 100 || g_speed_audio_mode != GB_SPEED_AUDIO_MUTE);
 }
 
@@ -7674,6 +7831,7 @@ static bool handle_runtime_event_inner(const SDL_Event* event, GBContext* ctx) {
             if (event->caxis.axis >= 0 && event->caxis.axis < SDL_CONTROLLER_AXIS_MAX) {
                 g_controller_axis_values[event->caxis.axis] = event->caxis.value;
             }
+            if (event->caxis.value >= 16000 || event->caxis.value <= -16000) g_last_input_device = 1;
             update_controller_axis_binding_state();
             update_effective_joypad_state();
             update_runtime_action_state(ctx);
@@ -7694,6 +7852,7 @@ static bool handle_runtime_event_inner(const SDL_Event* event, GBContext* ctx) {
             const bool pressed = (event->type == SDL_CONTROLLERBUTTONDOWN);
             uint8_t previous_dpad = g_joypad_dpad;
             uint8_t previous_buttons = g_joypad_buttons;
+            if (pressed) g_last_input_device = 1;
 
             if (event->cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
                 if (pressed) {
@@ -7730,6 +7889,7 @@ static bool handle_runtime_event_inner(const SDL_Event* event, GBContext* ctx) {
             const bool pressed = (event->type == SDL_KEYDOWN);
             uint8_t previous_dpad = g_joypad_dpad;
             uint8_t previous_buttons = g_joypad_buttons;
+            if (pressed) g_last_input_device = 0;
 
             switch (event->key.keysym.scancode) {
                 case SDL_SCANCODE_ESCAPE:
@@ -8003,14 +8163,14 @@ uint8_t gb_platform_get_joypad(void) {
  * one back with Rewind, or once the game is to end. */
 static bool paused_rewind_step_due(void);
 static bool wait_while_user_paused(void) {
-    if (!g_user_paused && !menu_holds_game()) {
+    if (!g_user_paused && !game_held()) {
         return false;
     }
     uint64_t last_present_ms = 0;
     /* A menu's Quit / Return to Launcher (clicked while this presents) and the
      * debug server's leave end the hold as well. */
     while (!g_quit_requested &&
-           (menu_holds_game() ||
+           (game_held() ||
             (g_user_paused && g_frame_advance_pending == 0 && !paused_rewind_step_due()))) {
         const uint64_t now_ms = SDL_GetTicks64();
         const uint64_t next_present_ms = last_present_ms + 16;
@@ -8029,7 +8189,7 @@ static bool wait_while_user_paused(void) {
             } while (SDL_PollEvent(&event));
         }
         gb_debug_server_poll();
-        if (!menu_holds_game() &&
+        if (!game_held() &&
             (!g_user_paused || g_frame_advance_pending > 0 || paused_rewind_step_due())) {
             break;
         }
@@ -8407,6 +8567,138 @@ void gb_platform_set_menu(const char* open, int pause_in_menu, int dim_percent, 
     menu_visibility_changed();
 }
 
+int gb_platform_game_action_held(int i) {
+    if (i < 0 || i >= g_game_action_count || menu_open()) return 0;
+    return input_action_is_pressed((GBInputAction)(GB_INPUT_ACTION_GAME_FIRST + i)) ? 1 : 0;
+}
+
+void gb_platform_game_action_bindings(int i, GBActionBinding keyboard[2], GBActionBinding controller[2]) {
+    for (int slot = 0; slot < 2; slot++) {
+        keyboard[slot] = GBActionBinding{0, 0};
+        controller[slot] = GBActionBinding{0, 0};
+        if (i < 0 || i >= g_game_action_count) continue;
+        const int action = GB_INPUT_ACTION_GAME_FIRST + i;
+        keyboard[slot] = GBActionBinding{(int)g_keyboard_bindings[action][slot].kind,
+                                         (int)g_keyboard_bindings[action][slot].code};
+        controller[slot] = GBActionBinding{(int)g_controller_bindings[action][slot].kind,
+                                           (int)g_controller_bindings[action][slot].code};
+    }
+}
+
+void gb_platform_binding_label(GBActionBinding binding, char* out, int size) {
+    if (!out || size <= 0) return;
+    const std::string label = binding_display_label(make_binding((GBInputBindingKind)binding.kind, binding.code));
+    snprintf(out, (size_t)size, "%s", label.c_str());
+}
+
+void gb_platform_joypad_bindings(int button, GBActionBinding keyboard[2], GBActionBinding controller[2]) {
+    for (int slot = 0; slot < 2; slot++) {
+        keyboard[slot] = GBActionBinding{0, 0};
+        controller[slot] = GBActionBinding{0, 0};
+        if (button < 0 || button >= GB_JOYPAD_ACTION_COUNT) continue;
+        keyboard[slot] = GBActionBinding{(int)g_keyboard_bindings[button][slot].kind,
+                                         (int)g_keyboard_bindings[button][slot].code};
+        controller[slot] = GBActionBinding{(int)g_controller_bindings[button][slot].kind,
+                                           (int)g_controller_bindings[button][slot].code};
+    }
+}
+
+int gb_platform_controller_family(void) {
+    if (g_controller_name.empty()) return -1;
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return 1;
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return 2;
+        case GB_CONTROLLER_LABEL_NINTENDO: return 3;
+        default: return 0;
+    }
+}
+
+int gb_platform_last_input_device(void) {
+    return g_last_input_device;
+}
+
+int gb_platform_joypad_held(void) {
+    const int override = gb_debug_server_get_input_override();
+    if (override >= 0) return override & 0xFF;
+    return (~g_joypad_dpad & 0x0F) | ((~g_joypad_buttons & 0x0F) << 4);
+}
+
+void gb_platform_set_game_screen(int open) {
+    g_game_screen_open = open != 0;
+    refresh_audio_device_pause_state();
+}
+
+/* The game's HUD textures (gb_platform_hud_texture) and their sizes. */
+static GLuint g_hud_textures[32];
+static int g_hud_sizes[32][2];
+
+uintptr_t gb_platform_hud_texture(int slot, const uint32_t* argb, int width, int height) {
+    if (!g_gl_context || slot < 0 || slot >= 32 || !argb || width <= 0 || height <= 0) return 0;
+    /* The picture's colors: its palette override and color correction. */
+    static std::vector<uint32_t> rgba;
+    convert_for_upload(argb, width, height, rgba);
+    GLuint& texture = g_hud_textures[slot];
+    if (!texture) glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    if (g_hud_sizes[slot][0] != width || g_hud_sizes[slot][1] != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        g_hud_sizes[slot][0] = width;
+        g_hud_sizes[slot][1] = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return (uintptr_t)texture;
+}
+
+/* The preset's output is opaque (shaders write alpha 1), so the HUD's own
+ * alpha is drawn into it afterwards: the plain texture through the "sharp"
+ * shader (which passes alpha on) with only alpha written, flipped so its top
+ * row lands on the output's (the output's first row is its top, as the
+ * input's is). */
+uintptr_t gb_platform_hud_shaded(int slot, float width, float height) {
+    if (!g_gl_context || !g_window || !g_shader_pipeline || !gb_lrs_active() || slot < 0 || slot >= 32 ||
+        !g_hud_textures[slot])
+        return 0;
+    int win_w = 0, win_h = 0, draw_w = 0, draw_h = 0;
+    SDL_GetWindowSize(g_window, &win_w, &win_h);
+    SDL_GL_GetDrawableSize(g_window, &draw_w, &draw_h);
+    const int out_w = (int)(width * draw_w / (float)(win_w > 0 ? win_w : 1) + 0.5f);
+    const int out_h = (int)(height * draw_h / (float)(win_h > 0 ? win_h : 1) + 0.5f);
+    const int w = g_hud_sizes[slot][0], h = g_hud_sizes[slot][1];
+    if (out_w <= 0 || out_h <= 0) return 0;
+    const GLuint shaded = gb_lrs_render_hud(slot < GB_LRS_HUD_CHAINS ? slot : GB_LRS_HUD_CHAINS - 1,
+                                            g_hud_textures[slot], w, h, out_w, out_h);
+    if (!shaded) return 0;
+    static GLuint fbo = 0;
+    if (!fbo) glGenFramebuffers(1, &fbo);
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    const GLboolean blend = glIsEnabled(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, shaded, 0);
+    const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (complete) {
+        glViewport(0, 0, out_w, out_h);
+        glDisable(GL_BLEND);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+        const int active = gb_shader_pipeline_active(g_shader_pipeline);
+        gb_shader_pipeline_set_active_by_name(g_shader_pipeline, "sharp");
+        gb_shader_pipeline_draw(g_shader_pipeline, g_hud_textures[slot], w, h, 0, out_h, out_w, -out_h, out_w, out_h);
+        if (active >= 0) gb_shader_pipeline_set_active(g_shader_pipeline, active);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    if (blend) glEnable(GL_BLEND);
+    return complete ? (uintptr_t)shaded : 0;
+}
+
 void gb_platform_get_menu_info(GBPlatformMenuInfo* out) {
     if (!out) return;
     *out = GBPlatformMenuInfo{};
@@ -8414,7 +8706,7 @@ void gb_platform_get_menu_info(GBPlatformMenuInfo* out) {
     out->main_open = g_runtime_ui && recomp_runtime_ui_is_open(g_runtime_ui);
 #endif
     out->settings_open = g_show_menu;
-    out->game_held = menu_holds_game();
+    out->game_held = game_held();
     out->pause_in_menu = g_menu_pauses_game;
     out->dim_percent = g_menu_dim_percent;
     out->opacity_percent = g_menu_opacity_percent;
@@ -9324,6 +9616,31 @@ void gb_platform_set_menu(const char* open, int pause_in_menu, int dim_percent, 
 }
 void gb_platform_get_menu_info(GBPlatformMenuInfo* out) {
     if (out) *out = GBPlatformMenuInfo{};
+}
+int gb_platform_game_action_held(int i) { (void)i; return 0; }
+void gb_platform_game_action_bindings(int i, GBActionBinding keyboard[2], GBActionBinding controller[2]) {
+    (void)i;
+    for (int slot = 0; slot < 2; slot++) keyboard[slot] = controller[slot] = GBActionBinding{0, 0};
+}
+void gb_platform_binding_label(GBActionBinding binding, char* out, int size) {
+    (void)binding;
+    if (out && size > 0) out[0] = 0;
+}
+void gb_platform_joypad_bindings(int button, GBActionBinding keyboard[2], GBActionBinding controller[2]) {
+    (void)button;
+    for (int slot = 0; slot < 2; slot++) keyboard[slot] = controller[slot] = GBActionBinding{0, 0};
+}
+int gb_platform_controller_family(void) { return -1; }
+int gb_platform_last_input_device(void) { return 0; }
+int gb_platform_joypad_held(void) { return 0; }
+void gb_platform_set_game_screen(int open) { (void)open; }
+uintptr_t gb_platform_hud_texture(int slot, const uint32_t* argb, int width, int height) {
+    (void)slot; (void)argb; (void)width; (void)height;
+    return 0;
+}
+uintptr_t gb_platform_hud_shaded(int slot, float width, float height) {
+    (void)slot; (void)width; (void)height;
+    return 0;
 }
 bool gb_platform_restart_game(void) { return false; }
 bool gb_platform_leave_game(const char* to) { (void)to; return false; }
